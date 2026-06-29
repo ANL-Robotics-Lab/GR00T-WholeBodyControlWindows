@@ -6,7 +6,10 @@ import os.path as osp
 from pathlib import Path
 import random
 import re
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
 
 import easydict
 import joblib
@@ -234,14 +237,31 @@ class MotionLibBase:
         self.skeleton_tree = skeleton.SkeletonTree.from_mjcf(skeleton_file)
         logger.info(f"Loaded skeleton from {skeleton_file}")
         logger.info(f"Loading motion data from {self.m_cfg.motion_file}...")
+
+
+        logger.warning(f"[MotionLib] config keys: {list(self.m_cfg.keys())}")
+        logger.warning(f"[MotionLib] adaptive_sampling config: {self.adaptive_sampling_cfg}")
+        logger.warning(f"[MotionLib] max_unique_motions before load_data: {self.m_cfg.get('max_unique_motions', None)}")
+
         self.load_data(self.m_cfg.motion_file)
-        self.use_adaptive_sampling = self.adaptive_sampling_cfg.get("enable", False)
+
+        self.setup_constants(
+        fix_height=motion_lib_cfg.get("fix_height", FixHeightMode.no_fix),
+        multi_thread=self.m_cfg.get("multi_thread", True),
+        )
+        # Windows porting safety: adaptive sampling currently crashes inside joblib.load(...)
+        # during init_adaptive_sampling when scanning the full motion dataset.
+        if os.name == "nt":
+            logger.warning("[MotionLib] Forcing adaptive_sampling=False on Windows.")
+            self.use_adaptive_sampling = False
+        else:
+            self.use_adaptive_sampling = self.adaptive_sampling_cfg.get("enable", False)
+
+        logger.warning(f"[MotionLib] use_adaptive_sampling final: {self.use_adaptive_sampling}")
+
         if self.use_adaptive_sampling:
             self.init_adaptive_sampling()
-        self.setup_constants(
-            fix_height=motion_lib_cfg.get("fix_height", FixHeightMode.no_fix),
-            multi_thread=self.m_cfg.get("multi_thread", True),
-        )
+        
 
         self.vid_smpl_pose = None
         self.vid_smpl_joints = None
@@ -1067,6 +1087,14 @@ class MotionLibBase:
         if self.use_adaptive_sampling:
             self.update_adaptive_sampling_motion_sequences()
 
+        if not hasattr(self, "_sampling_prob"):
+            logger.warning(
+            "[MotionLib] _sampling_prob was missing; creating uniform sampling probabilities."
+            )
+            self._sampling_prob = (
+                torch.ones(self._num_unique_motions, device=self._device) / self._num_unique_motions
+            )
+
         if random_sample:
             sample_idxes = torch.multinomial(
                 self._sampling_prob, num_samples=num_motion_to_load, replacement=True
@@ -1108,31 +1136,37 @@ class MotionLibBase:
         torch.set_num_threads(1)
 
         # Increase file descriptor limit to prevent "too many open files" error
-        try:
-            soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
-            target_limit = 1048576
+        if resource is not None:
+            try:
+                soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+                target_limit = 1048576
 
-            # Try to set both soft and hard limits
-            if soft_limit < target_limit:
-                try:
-                    # First try to increase hard limit (requires root)
-                    resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, target_limit))
-                    logger.info(
-                        f"Increased file descriptor limits from {soft_limit}/{hard_limit} to {target_limit}/{target_limit}"  # noqa: E501
-                    )
-                except PermissionError:
-                    # Fallback to increasing only soft limit up to hard limit
-                    new_soft = min(target_limit, hard_limit)
-                    resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard_limit))
-                    logger.info(
-                        f"Increased soft file descriptor limit from {soft_limit} to {new_soft} (hard limit: {hard_limit})"  # noqa: E501
-                    )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Could not increase file descriptor limit: {e}")
+                if soft_limit < target_limit:
+                    try:
+                        resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, target_limit))
+                        logger.info(
+                            f"Increased file descriptor limits from "
+                            f"{soft_limit}/{hard_limit} to {target_limit}/{target_limit}"
+                        )
+                    except PermissionError:
+                        new_soft = min(target_limit, hard_limit)
+                        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard_limit))
+                        logger.info(
+                            f"Increased soft file descriptor limit from "
+                            f"{soft_limit} to {new_soft} (hard limit: {hard_limit})"
+                        )
+            except Exception as e:
+                logger.warning(f"Could not increase file descriptor limit: {e}")
+        else:
+            logger.info("Skipping file descriptor limit adjustment on Windows.")
 
         manager = mp.Manager()
         queue = manager.Queue()
         num_jobs = min(min(mp.cpu_count(), 32), len(motion_data_list))  # noqa: PLW3301
+
+        if os.name == "nt":
+            logger.warning("[MotionLib] Forcing single-process motion loading on Windows.") #pickling issue, could probably be fixed
+            num_jobs = 1
 
         if num_jobs <= 8 or not self.multi_thread or len(motion_data_list) <= 128:
             num_jobs = 1

@@ -1,0 +1,263 @@
+# @package _global_
+# SONIC RBY1 config — starter experiment config for the 24-DOF clean RBY1 embodiment.
+#
+# Baseline philosophy:
+#   - Follow sonic_h2.yaml rather than sonic_release.yaml.
+#   - Keep the existing SONIC reward / termination compositions initially,
+#     but override their G1/H2 body-name assumptions for RBY1.
+#   - Use the clean 24-DOF MJCF as the motion-library asset.
+#   - Leave motion_file unset until RBY1-retargeted PKLs are ready.
+
+defaults:
+  - /algo: ppo_im_phc
+  - /manager_env: base_env
+  - /callbacks/read_eval
+  - /callbacks/im_resample
+  - /aux_losses: universal_token/g1_recon_and_all_latent
+  - override /trainer: trl_ppo_aux
+  - override /actor_critic: universal_token/all_mlp_v1
+  - override /manager_env/observations/tokenizer: unitoken_all_noz
+  - override /manager_env/observations/policy: local_dir_hist
+  - override /manager_env/observations/critic: privileged_mf_hist
+  - override /manager_env/events: tracking/level0_4
+  - override /manager_env/terminations: tracking/base_adaptive_strict_ori_foot_xyz
+  - override /manager_env/rewards: tracking/base_5point_local_feet_acc
+
+use_manager_env: true
+
+exp_base: ${hydra:runtime.choices.exp}
+exp_var: test
+experiment_name: ${exp_base}_${exp_var}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 4096
+project_name: TRL_RBY1_Track
+
+actor_prop_history_length: 10
+actor_actions_history_length: 10
+
+critic_prop_history_length: 10
+critic_actions_history_length: 10
+
+manager_env:
+  # -------------------------------------------------------------------
+  # Event-term overrides
+  # -------------------------------------------------------------------
+  events:
+    # Disable COM randomization during initial RBY1 bring-up.
+    # The inherited event expects a G1/H2-style body name and is not needed
+    # to validate robot/motion-lib/config wiring.
+    base_com: null
+    randomize_rigid_body_mass: null
+
+  observations:
+    tokenizer:
+      joint_pos_multi_future_wrist_for_smpl:
+        params:
+          joints_idx: [12, 13, 14, 19, 20, 21]
+
+  # -------------------------------------------------------------------
+  # Reward-term overrides
+  # -------------------------------------------------------------------
+  rewards:
+    # Reuse the existing feet_acc term as a wheel acceleration regularizer.
+    # If this turns out to be unhelpful, set weight: 0.0 or create a dedicated wheel_acc term.
+    feet_acc:
+      weight: -2.5e-8
+      params:
+        asset_cfg:
+          joint_names: [".*wheel.*"]
+
+    joint_limit:
+      weight: -2.0
+      params:
+        asset_cfg:
+          joint_names:
+            [
+              "torso_.*",
+              "left_arm_.*",
+              "right_arm_.*",
+              "head_.*",
+            ]
+
+    # The stock term references G1-style wrist/head body names.
+    anti_shake_ang_vel:
+      params:
+        body_names:
+          [
+            "link_left_arm_6",
+            "link_right_arm_6",
+            "link_head_2",
+          ]
+
+    # The stock G1 term allows ankle / wrist / elbow contact.
+    # For a wheeled RBY1 baseline, allow wheel contact only and penalize other contacts.
+    undesired_contacts:
+      params:
+        sensor_cfg:
+          body_names:
+            - '^(?!wheel_l$)(?!wheel_r$).+$'
+
+  # -------------------------------------------------------------------
+  # Termination-term overrides
+  # -------------------------------------------------------------------
+  terminations:
+    # The stock ee_body_pos term uses feet + wrists.
+    # For RBY1, use wheels + distal arm bodies.
+    ee_body_pos:
+      params:
+        body_names:
+          [
+            "wheel_l",
+            "wheel_r",
+            "link_left_arm_6",
+            "link_right_arm_6",
+          ]
+
+    # Reuse the stock foot position termination as a wheel position termination.
+    foot_pos_xyz:
+      params:
+        body_names:
+          [
+            "wheel_l",
+            "wheel_r",
+          ]
+
+  config:
+    robot:
+      type: rby1
+    terrain_type: trimesh
+
+  commands:
+    motion:
+      # USD articulation exposes 28 joints, but the RBY1 motion library is 24-DOF.
+      # This activates TrackingCommand's DOF-mismatch path.
+      motion_lib_num_dof: 24
+      hand_default_positions: [0.0, 0.0, 0.0, 0.0]
+      hand_default_velocities: [0.0, 0.0, 0.0, 0.0]
+      # Root body in the RBY1 MJCF/URDF.
+      anchor_body: "base"
+
+      # Three teleop / VR-style tracking points:
+      # distal left arm, distal right arm, upper torso.
+      #
+      # Offsets are a starting guess:
+      # - arm_6 body is proximal to the removed end-effector branch, so -Z offsets
+      #   approximate the former tool point in the original RBY1 MJCF.
+      # - torso offset approximates an upper-body/head reference point.
+      #
+      # Visualize these before trusting them.
+      vr_3point_body:
+        [
+          "link_left_arm_6",
+          "link_right_arm_6",
+          "link_torso_5",
+        ]
+      vr_3point_body_offset:
+        [
+          [0.0, 0.0, -0.20],
+          [0.0, 0.0, -0.20],
+          [0.0, 0.0, 0.25],
+        ]
+
+      # Main reward points used by the experiment YAMLs you provided.
+      reward_point_body:
+        [
+          "link_torso_5",
+          "link_left_arm_6",
+          "link_right_arm_6",
+        ]
+      reward_point_body_offset:
+        [
+          [0.0, 0.0, 0.25],
+          [0.0, 0.0, -0.20],
+          [0.0, 0.0, -0.20],
+        ]
+
+      # Preserve a 14-body tracked set analogous in size to SONIC's default command template.
+      # RBY1 does not have humanoid legs, so these are a pragmatic first-pass selection:
+      # root + wheels + torso chain + representative arm/head bodies.
+      body_names:
+        [
+          "base",
+          "wheel_l",
+          "wheel_r",
+          "link_torso_1",
+          "link_torso_3",
+          "link_torso_5",
+          "link_left_arm_1",
+          "link_left_arm_3",
+          "link_left_arm_6",
+          "link_right_arm_1",
+          "link_right_arm_3",
+          "link_right_arm_6",
+          "link_head_1",
+          "link_head_2",
+        ]
+
+      num_future_frames: 10
+      dt_future_ref_frames: 0.1
+      smpl_num_future_frames: 10
+      smpl_dt_future_ref_frames: 0.02
+      cat_upper_body_poses: true
+      cat_upper_body_poses_prob: 0.5
+
+      freeze_frame_aug: true
+      teleop_sample_prob_when_smpl: 0.5
+
+      motion_lib_cfg:
+        adaptive_sampling:
+          adp_samp_failure_rate_max_over_mean: 200
+
+        # Provide the actual RBY1 PKL directory on the command line when available.
+        motion_file: null
+
+        # Use dummy until matching RBY1 motion keys + SMPL data are available.
+        smpl_motion_file: dummy
+        smpl_y_up: true
+
+        asset:
+          # Use the flattened MJCF here. SONIC's SkeletonTree parser uses Python
+          # ElementTree and does not expand MuJoCo <include> tags before searching
+          # for <worldbody>, so the skeleton asset must contain worldbody directly.
+          assetFileName: "model_v1.2_24dof_clean_flat.xml"
+
+algo:
+  config:
+    empty_cache_every_n_ppo_epoch: -1
+    num_steps_per_env: 24
+    use_clampped_std: true
+    std_clamp_min: 0.001
+    std_clamp_max: 0.5
+    max_grad_norm: 0.1
+
+    actor:
+      backbone:
+        reencode_smpl_g1_recon: true
+        encoders:
+          g1:
+            inputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
+          teleop:
+            inputs:
+              [
+                "command_multi_future_lower_body",
+                "vr_3point_local_target",
+                "vr_3point_local_orn_target",
+                "motion_anchor_ori_b",
+              ]
+          smpl:
+            inputs:
+              [
+                "smpl_joints_multi_future_local_nonflat",
+                "smpl_root_ori_b_multi_future",
+                "joint_pos_multi_future_wrist_for_smpl",
+              ]
+        decoders:
+          g1_kin:
+            outputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
+
+    critic:
+      backbone:
+        module_config_dict:
+          layer_config:
+            hidden_dims: [2048, 2048, 1024, 1024, 512, 512]

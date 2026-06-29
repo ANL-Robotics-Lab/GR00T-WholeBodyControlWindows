@@ -201,6 +201,94 @@ class H2Converter(IsaacLabMuJoCoConverter):
     VR_3POINTS_BODY_NAMES = ["torso_link", "left_wrist_pitch_link", "right_wrist_pitch_link"]
     FOOT_BODY_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
+class RBY1Converter(IsaacLabMuJoCoConverter):
+    """RBY1 robot joint/body order converter between IsaacLab and MuJoCo conventions."""
+
+    def __init__(self):
+        # Lazy import to avoid circular dependency:
+        # order_converter -> rby1 -> mdp/__init__ -> commands -> order_converter
+        from gear_sonic.envs.manager_env.robots.rby1 import (
+            RBY1_ISAACLAB_JOINTS,
+            RBY1_ISAACLAB_TO_MUJOCO_BODY,
+            RBY1_ISAACLAB_TO_MUJOCO_DOF,
+            RBY1_MUJOCO_TO_ISAACLAB_BODY,
+            RBY1_MUJOCO_TO_ISAACLAB_DOF,
+        )
+
+        self.JOINT_NAMES = RBY1_ISAACLAB_JOINTS
+
+        self.DOF_MAPPINGS = {
+            ("isaaclab", "mujoco"): RBY1_ISAACLAB_TO_MUJOCO_DOF,
+            ("mujoco", "isaaclab"): RBY1_MUJOCO_TO_ISAACLAB_DOF,
+        }
+
+        self.BODY_MAPPINGS = {
+            ("isaaclab", "mujoco"): RBY1_ISAACLAB_TO_MUJOCO_BODY,
+            ("mujoco", "isaaclab"): RBY1_MUJOCO_TO_ISAACLAB_BODY,
+        }
+
+    # Three bodies used for VR/MPJPE-style upper-body tracking.
+    # For the clean 24-DOF RBY1 MJCF:
+    #   - link_torso_5 is the upper torso terminal body
+    #   - link_left_arm_6 / link_right_arm_6 are the distal wrist/tool bodies
+    VR_3POINTS_BODY_NAMES = [
+        "link_torso_5",
+        "link_left_arm_6",
+        "link_right_arm_6",
+    ]
+
+    # RBY1 has wheels, not feet.
+    # These serve as the two lower support/distal bodies when code expects
+    # a pair analogous to feet for reconstruction-style indexing.
+    FOOT_BODY_NAMES = [
+        "wheel_l",
+        "wheel_r",
+    ]
+
+    @property
+    def vr_3points_mujoco_indices(self):
+        """VR 3-point body indices in full MuJoCo body order."""
+        mj_names = [self.JOINT_NAMES[i] for i in self.isaaclab_to_mujoco_body]
+        return [mj_names.index(n) for n in self.VR_3POINTS_BODY_NAMES]
+
+    @property
+    def foot_mujoco_indices(self):
+        """Wheel/support-body indices in full MuJoCo body order."""
+        mj_names = [self.JOINT_NAMES[i] for i in self.isaaclab_to_mujoco_body]
+        return [mj_names.index(n) for n in self.FOOT_BODY_NAMES]
+
+    @property
+    def isaaclab_to_mujoco_dof(self):
+        """DOF reorder indices: IsaacLab -> MuJoCo."""
+        return self.DOF_MAPPINGS[("isaaclab", "mujoco")]
+
+    @property
+    def mujoco_to_isaaclab_dof(self):
+        """DOF reorder indices: MuJoCo -> IsaacLab."""
+        return self.DOF_MAPPINGS[("mujoco", "isaaclab")]
+
+    @property
+    def isaaclab_to_mujoco_body(self):
+        """Body reorder indices: IsaacLab -> MuJoCo."""
+        return self.BODY_MAPPINGS[("isaaclab", "mujoco")]
+
+    @property
+    def mujoco_to_isaaclab_body(self):
+        """Body reorder indices: MuJoCo -> IsaacLab."""
+        return self.BODY_MAPPINGS[("mujoco", "isaaclab")]
+
+    def get_isaaclab_to_mujoco_mapping(self):
+        """Return the full mapping dict for body/DOF reordering."""
+        return {
+            "isaaclab_joints": self.JOINT_NAMES,
+            "isaaclab_to_mujoco_dof": self.isaaclab_to_mujoco_dof,
+            "mujoco_to_isaaclab_dof": self.mujoco_to_isaaclab_dof,
+            "isaaclab_to_mujoco_body": self.isaaclab_to_mujoco_body,
+            "mujoco_to_isaaclab_body": self.mujoco_to_isaaclab_body,
+        }
+
+
+
 
 def load_qpos_from_csv(csv_path: str) -> torch.Tensor:
     """Load qpos [T, D] from CSV."""
