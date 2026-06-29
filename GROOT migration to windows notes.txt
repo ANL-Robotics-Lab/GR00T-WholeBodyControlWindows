@@ -1,0 +1,77 @@
+GROOT migration to windows notes
+
+setup - conda env installing Isaac lab 2.3.2 using pip with Isaac lab 5.1 and python 3.11 
+
+issue - python download_from_hf.py --training has an extraction step that is Linux exclusive
+
+solution- was able to create a windows compatible script for this  
+
+issue - Isaac lab task startup may fail due to h5py version 16.0 instead of using 15.1 on windows, this also attempted to update numpy which had to be backdated back to 1.26.4 again after 
+
+solution - backdated h5py to 15.1, reverted numpy after back to 1.26.4 after install
+
+
+file: motion_lib_base (gear_sonic - utils - motion_lib
+
+issues - resource module not available on windows to increase file descriptor count
+
+solution: added operating system check to skip
+
+issue - imported easydictre instead of easydict
+
+solution: corrected to easydict
+
+issue - lxml is not installed in isaac lab python env on windows by default 
+
+solution - installed lxml 
+
+issue - open3d is not installed in Isaac lab python env on windows by default
+
+solution - installed open3d
+
+issue - adaptive sampling is causing kit to hang somewhere in windows in joblin.load
+
+solution - disabled adaptive sampling on windows for now
+
+issue - constants seem to be unset without calling self.setup_constants in _init_ in windows
+
+solution - temporarily added a call to existing function self.setup_constants to set these constants before they are used
+
+issue - crash after rewards load caused by missing torchrl dependency on windows 
+
+solution - backdated torchrl and tensordict to 0.8.1
+
+issue - missing dependency vector-quantize-pytorch
+
+solution - installed vector-quantize-pytorch-1.28.2
+
+-at this point it seemed to at least proceed with learning iterations with adaptive sampling disabled
+
+issue - windows multiprocessing wants process arguments and targets to be pickleable so env >= 128 fails
+
+solution - 
+
+can either force num_jobs = 1 at the cost of windows resampling speed or fix self.load_motion_with_skeleton to be pickleable 
+
+result - can run training without adaptive sampling with 4096 env on windows but very slow on 1 laptop/workstation ada 5000 around 13 second iteration time would be 2 weeks to get 100k iterations. 64x gpu I assume would reduce that to around 6hrs which might be acceptable. Did not see reward increase much (random 0.6-1.2) at very low iteration (1-100), reward increased to 1.2-2 after 500 iterations showing some improvement on each reward and 2 motion resampling events 
+
+logs_rl\TRL_G1_Track\manager\universal_token\all_modes\sonic_release_test-20260506_024229\last.pt
+
+python gear_sonic/data_process/rby1_retarget_seed_to_motionlib.py --input C:\Users\bcarc_ziwaj0x\Downloads\g1\csv --output data/rby1_seed_projection/robot --input-format bones_g1_csv_projection --fps-source 120 --fps 30 --individual --recursive --wheel-radius 0.10 --wheel-track 0.53
+
+conda activate env_lab
+
+python gear_sonic\train_agent_trl.py +exp=manager/universal_token/all_modes/sonic_release num_envs=4096 headless=True ++algo.config.num_learning_iterations=1000 ++manager_env.motion_lib.adaptive_sampling.enable=false
+
+python gear_sonic\train_agent_trl.py +exp=manager/universal_token/all_modes/sonic_release num_envs=200 headless=False ++algo.config.num_learning_iterations=1000 ++manager_env.motion_lib.adaptive_sampling.enable=false
+
+python gear_sonic/train_agent_trl.py +exp=manager/universal_token/all_modes/sonic_release +checkpoint=sonic_release/last.pt num_envs=200 headless=False ++manager_env.commands.motion.motion_lib_cfg.motion_file=C:\Users\bcarc_ziwaj0x\Desktop\groot\GR00T-WholeBodyControl\data\motion_lib_bones_seed\robot_filtered ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=C:\Users\bcarc_ziwaj0x\Desktop\groot\GR00T-WholeBodyControl\data\smpl_filtered
+
+python gear_sonic/train_agent_trl.py +exp=manager/universal_token/all_modes/sonic_release +checkpoint=sonic_release/last.pt num_envs=200 headless=True ++manager_env.commands.motion.motion_lib_cfg.motion_file=C:\Users\bcarc_ziwaj0x\Desktop\groot\GR00T-WholeBodyControl\data\motion_lib_bones_seed\robot_filtered ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=C:\Users\bcarc_ziwaj0x\Desktop\groot\GR00T-WholeBodyControl\data\smpl_filtered
+
+
+python gear_sonic/train_agent_trl.py +exp=manager/universal_token/all_modes/sonic_rby1 num_envs=16 headless=False use_wandb=false ++algo.config.num_learning_iterations=1000 ++manager_env.motion_lib.adaptive_sampling.enable=false ++manager_env.commands.motion.motion_lib_cfg.motion_file=data/rby1_seed_projection/robot ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=dummy
+
+python gear_sonic/train_agent_trl.py +exp=manager/universal_token/all_modes/sonic_rby1 +checkpoint=sonic_release/last.pt num_envs=16 headless=False use_wandb=false ++algo.config.num_learning_iterations=1000 ++manager_env.motion_lib.adaptive_sampling.enable=false ++manager_env.commands.motion.motion_lib_cfg.motion_file=data/rby1_seed_projection/robot ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=dummy
+
+python gear_sonic/train_agent_trl.py +exp=manager/universal_token/all_modes/sonic_rby1 num_envs=200 headless=False use_wandb=false ++algo.config.num_learning_iterations=1000 ++manager_env.motion_lib.adaptive_sampling.enable=false ++manager_env.commands.motion.motion_lib_cfg.motion_file=data/rby1_seed_projection/robot ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=dummy
