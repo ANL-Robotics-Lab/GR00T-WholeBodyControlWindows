@@ -1,0 +1,14 @@
+# RBY1 keeps the existing full articulation-order action vector, but its drive
+# wheels are velocity controlled while the articulated upper body is position
+# controlled. Passive caster joints remain in the imported USD and are ignored.
+
+_target_: gear_sonic.envs.manager_env.mdp.actions.ActionsCfg
+
+joint_pos:
+  _target_: gear_sonic.envs.manager_env.mdp.actions.RBY1MixedJointActionCfg
+  asset_name: robot
+  joint_names: [".*"]
+  wheel_joint_names: [right_wheel, left_wheel]
+  passive_joint_names: [backwheel, backwheel2]
+  wheel_velocity_limit: 15.707963268
+  use_default_offset: true

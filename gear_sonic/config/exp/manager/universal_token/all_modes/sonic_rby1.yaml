@@ -1,12 +1,8 @@
 # @package _global_
 # SONIC RBY1 config — starter experiment config for the 24-DOF clean RBY1 embodiment.
 #
-# Baseline philosophy:
-#   - Follow sonic_h2.yaml rather than sonic_release.yaml.
-#   - Keep the existing SONIC reward / termination compositions initially,
-#     but override their G1/H2 body-name assumptions for RBY1.
-#   - Use the clean 24-DOF MJCF as the motion-library asset.
-#   - Leave motion_file unset until RBY1-retargeted PKLs are ready.
+# RBY1-specific actions, rewards, and terminations account for its
+# differential-drive base and articulated upper body.
 
 defaults:
   - /algo: ppo_im_phc
@@ -20,8 +16,9 @@ defaults:
   - override /manager_env/observations/policy: local_dir_hist
   - override /manager_env/observations/critic: privileged_mf_hist
   - override /manager_env/events: tracking/level0_4
-  - override /manager_env/terminations: tracking/base_adaptive_strict_ori_foot_xyz
-  - override /manager_env/rewards: tracking/base_5point_local_feet_acc
+  - override /manager_env/actions: tracking/rby1
+  - override /manager_env/terminations: tracking/rby1_motion
+  - override /manager_env/rewards: tracking/rby1_motion
 
 use_manager_env: true
 
@@ -40,14 +37,28 @@ critic_prop_history_length: 10
 critic_actions_history_length: 10
 
 manager_env:
+  # Preserve the retargeted CSV exactly during kinematic replay. Enable clipping
+  # only when testing articulation safety rather than converter fidelity.
+  replay_clip_joint_limits: false
+  replay_joint_log: false
+  replay_joint_log_post_write: false
+  # Used only when replay_clip_joint_limits is enabled. RBY's torso_1..3 are
+  # serial pitch joints, so their valid individual limits can still over-bend.
+  replay_torso_pitch_limit: 0.6  # radians, aggregate torso pitch
+  replay_planar_root: true  # discard source root roll/pitch; preserve heading
+
   # -------------------------------------------------------------------
   # Event-term overrides
   # -------------------------------------------------------------------
   events:
-    # Disable COM randomization during initial RBY1 bring-up.
-    # The inherited event expects a G1/H2-style body name and is not needed
-    # to validate robot/motion-lib/config wiring.
+    # Keep the first RBY1 imitation stage deterministic. The inherited humanoid
+    # setup otherwise injects +/-0.5 m/s base velocity at reset, applies another
+    # push every 4-6 s, and randomizes wheel/caster friction. Reintroduce those
+    # perturbations only after the unperturbed dance is stable.
+    physics_material: null
+    add_joint_default_pos: null
     base_com: null
+    push_robot: null
     randomize_rigid_body_mass: null
 
   observations:
@@ -60,16 +71,47 @@ manager_env:
   # Reward-term overrides
   # -------------------------------------------------------------------
   rewards:
-    # Reuse the existing feet_acc term as a wheel acceleration regularizer.
-    # If this turns out to be unhelpful, set weight: 0.0 or create a dedicated wheel_acc term.
-    feet_acc:
-      weight: -2.5e-8
+    # Track articulated upper-body links. Drive-wheel rotation is handled by
+    # tracking_wheel_vel rather than quaternion/body-orientation rewards.
+    tracking_relative_body_pos:
       params:
-        asset_cfg:
-          joint_names: [".*wheel.*"]
+        # The previous 0.3 m kernel yielded only ~0.03 reward and stopped
+        # shaping the policy once the arms diverged from the reference.
+        std: 0.5
+        body_names: &rby1_upper_body_reward_links
+          [
+            "link_torso_1",
+            "link_torso_3",
+            "link_torso_5",
+            "link_left_arm_1",
+            "link_left_arm_3",
+            "link_left_arm_6",
+            "link_right_arm_1",
+            "link_right_arm_3",
+            "link_right_arm_6",
+            "link_head_1",
+            "link_head_2",
+          ]
+
+    tracking_relative_body_ori:
+      params:
+        # Preserve a gradient at the roughly one-radian errors seen early in
+        # training; this can be tightened after the coarse pose is learned.
+        std: 0.8
+        body_names: *rby1_upper_body_reward_links
+
+    tracking_body_linvel:
+      params:
+        body_names: *rby1_upper_body_reward_links
+
+    tracking_body_angvel:
+      params:
+        body_names: *rby1_upper_body_reward_links
 
     joint_limit:
-      weight: -2.0
+      # Hard articulation limits remain enforced by the simulator. Keep this
+      # soft-limit cost below the upper-body pose signal during initial imitation.
+      weight: -0.5
       params:
         asset_cfg:
           joint_names:
@@ -80,40 +122,18 @@ manager_env:
               "head_.*",
             ]
 
-    # The stock term references G1-style wrist/head body names.
-    anti_shake_ang_vel:
-      params:
-        body_names:
-          [
-            "link_left_arm_6",
-            "link_right_arm_6",
-            "link_head_2",
-          ]
-
-    # The stock G1 term allows ankle / wrist / elbow contact.
-    # For a wheeled RBY1 baseline, allow wheel contact only and penalize other contacts.
+    # Allow the two drive wheels and four passive caster bodies to contact
+    # terrain. Penalize contacts on the base, torso, arms, head, and tools.
     undesired_contacts:
       params:
         sensor_cfg:
           body_names:
-            - '^(?!wheel_l$)(?!wheel_r$).+$'
+            - '^(?!(wheel_l|wheel_r|Cylinder|Cylinder_01|Cylinder_02|Cylinder_03)$).+$'
 
   # -------------------------------------------------------------------
   # Termination-term overrides
   # -------------------------------------------------------------------
   terminations:
-    # The stock ee_body_pos term uses feet + wrists.
-    # For RBY1, use wheels + distal arm bodies.
-    ee_body_pos:
-      params:
-        body_names:
-          [
-            "wheel_l",
-            "wheel_r",
-            "link_left_arm_6",
-            "link_right_arm_6",
-          ]
-
     # Reuse the stock foot position termination as a wheel position termination.
     foot_pos_xyz:
       params:
@@ -124,6 +144,8 @@ manager_env:
           ]
 
   config:
+    # The 9-fps trainable clip lasts 12.78 s; leave reset margin after its end.
+    episode_length_s: 14.0
     robot:
       type: rby1
     terrain_type: trimesh
@@ -199,18 +221,40 @@ manager_env:
       dt_future_ref_frames: 0.1
       smpl_num_future_frames: 10
       smpl_dt_future_ref_frames: 0.02
-      cat_upper_body_poses: true
-      cat_upper_body_poses_prob: 0.5
-
-      freeze_frame_aug: true
+      # Train against the verified PKL itself. Pose concatenation and random
+      # frame freezing can replace or hold its already-forward torso poses.
+      cat_upper_body_poses: false
+      freeze_frame_aug: false
       teleop_sample_prob_when_smpl: 0.5
+
+      # A single clip spans the full 14 s episode, so beginning at frame zero
+      # provides a stable progression instead of resetting directly into the
+      # most strongly leaned frame.
+      start_from_first_frame: true
+      pose_range:
+        x: [-0.01, 0.01]
+        y: [-0.01, 0.01]
+        z: [0.0, 0.0]
+        roll: [-0.02, 0.02]
+        pitch: [-0.02, 0.02]
+        yaw: [-0.05, 0.05]
+      velocity_range:
+        x: [-0.05, 0.05]
+        y: [-0.05, 0.05]
+        z: [0.0, 0.0]
+        roll: [-0.05, 0.05]
+        pitch: [-0.05, 0.05]
+        yaw: [-0.1, 0.1]
+      joint_position_range: [-0.02, 0.02]
+      joint_velocity_range: [0.0, 0.0]
 
       motion_lib_cfg:
         adaptive_sampling:
           adp_samp_failure_rate_max_over_mean: 200
 
-        # Provide the actual RBY1 PKL directory on the command line when available.
-        motion_file: null
+        # Wheel-feasible 12.78 s dance, smoothed so all frame-to-frame joint
+        # speeds stay within the configured RBY1 actuator limits.
+        motion_file: tmp_rby1_video_compare/guy_dancing_rby1_from_original_bvh_trainable_9fps_smoothed7.pkl
 
         # Use dummy until matching RBY1 motion keys + SMPL data are available.
         smpl_motion_file: dummy

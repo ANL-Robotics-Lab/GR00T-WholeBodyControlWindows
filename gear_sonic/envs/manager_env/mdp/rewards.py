@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
@@ -19,6 +20,7 @@ from gear_sonic.envs.manager_env.mdp.commands import (
     TrackingCommand,
     _get_body_indexes,
 )
+from gear_sonic.trl.utils.torch_transform import get_heading_q
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -54,6 +56,15 @@ class RewardsCfg:
     feet_acc = None
     is_terminated = None
     upright_penalty = None
+    tracking_planar_anchor_pos = None
+    tracking_anchor_yaw = None
+    tracking_base_forward_vel = None
+    tracking_base_yaw_rate = None
+    tracking_upper_body_joint_pos = None
+    tracking_upper_body_points = None
+    tracking_wheel_vel = None
+    wheel_acc = None
+    anti_tip_ang_vel = None
 
 
 def tracking_anchor_pos_error(
@@ -96,6 +107,237 @@ def tracking_anchor_ori_error(
     command: TrackingCommand = env.command_manager.get_term(command_name)
     angular_err = quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w)
     return torch.exp(-angular_err.square() / (std * std))
+
+
+def tracking_planar_anchor_pos_error(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Track only base X/Y position for a planar wheeled robot.
+
+    RBY1's motion-library root height is a serialization convention and does
+    not necessarily equal the imported USD base-link height, so including Z in
+    this reward creates a constant, unachievable error.
+    """
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    diff_xy = command.anchor_pos_w[:, :2] - command.robot_anchor_pos_w[:, :2]
+    return torch.exp(-diff_xy.square().sum(dim=-1) / (std * std))
+
+
+def tracking_anchor_yaw_error(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Track base heading while leaving roll/pitch to the upright penalty."""
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    ref_heading = get_heading_q(command.anchor_quat_w)
+    robot_heading = get_heading_q(command.robot_anchor_quat_w)
+    angular_err = quat_error_magnitude(ref_heading, robot_heading)
+    return torch.exp(-angular_err.square() / (std * std))
+
+
+def tracking_rby1_forward_velocity_error(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Track forward base speed without demanding non-holonomic lateral motion."""
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    ref_heading = get_heading_q(command.anchor_quat_w)
+    robot_heading = get_heading_q(command.robot_anchor_quat_w)
+    ref_vel_local = quat_apply(quat_inv(ref_heading), command.anchor_lin_vel_w)
+    robot_vel_local = quat_apply(quat_inv(robot_heading), command.robot_anchor_lin_vel_w)
+    error = ref_vel_local[:, 0] - robot_vel_local[:, 0]
+    return torch.exp(-error.square() / (std * std))
+
+
+def tracking_rby1_yaw_rate_error(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Track the yaw component of base angular velocity."""
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    error = command.anchor_ang_vel_w[:, 2] - command.robot_anchor_ang_vel_w[:, 2]
+    return torch.exp(-error.square() / (std * std))
+
+
+def tracking_rby1_joint_pos_error(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    joint_names: list[str],
+    joint_weights: list[float] | None = None,
+) -> torch.Tensor:
+    """Track RBY1 upper-body joints by name across motion and articulation orderings.
+
+    The RBY1 motion library stores DOFs in MuJoCo order while Isaac Lab exposes
+    articulation state in USD order. Resolving both sides by joint name avoids
+    rewarding the wrong joint when those orderings differ. Drive wheels and
+    passive/gripper joints should be omitted from ``joint_names`` because they
+    are either velocity controlled or absent from the reference motion.
+
+    ``joint_weights`` is normalized before use, so it changes the relative
+    importance of joints without changing the reward's [0, 1] range.
+    """
+    if not math.isfinite(std) or std <= 0.0:
+        raise ValueError(f"RBY1 joint-position reward std must be positive, got {std}.")
+    if not joint_names:
+        raise ValueError("RBY1 joint-position reward requires at least one joint name.")
+
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    mapping = env.cfg.isaaclab_to_mujoco_mapping
+    reference_names = mapping.get("mujoco_dof_names")
+    if reference_names is None:
+        raise ValueError(
+            "RBY1 joint-position reward requires 'mujoco_dof_names' in the robot mapping."
+        )
+
+    missing_reference = [name for name in joint_names if name not in reference_names]
+    missing_robot = [name for name in joint_names if name not in command.robot.joint_names]
+    if missing_reference or missing_robot:
+        raise ValueError(
+            "Could not resolve RBY1 joint-position reward joints. "
+            f"Missing reference={missing_reference}, robot={missing_robot}."
+        )
+
+    reference_indices = [reference_names.index(name) for name in joint_names]
+    robot_indices = [command.robot.joint_names.index(name) for name in joint_names]
+    squared_error = (
+        command.joint_pos[:, reference_indices]
+        - command.robot_joint_pos[:, robot_indices]
+    ).square()
+
+    if joint_weights is None:
+        mean_squared_error = squared_error.mean(dim=-1)
+    else:
+        if len(joint_weights) != len(joint_names):
+            raise ValueError(
+                "RBY1 joint-position reward expected one weight per joint: "
+                f"got {len(joint_weights)} weights for {len(joint_names)} joints."
+            )
+        if (
+            any(not math.isfinite(weight) or weight < 0.0 for weight in joint_weights)
+            or sum(joint_weights) <= 0.0
+        ):
+            raise ValueError(
+                "RBY1 joint-position reward weights must be finite, non-negative, "
+                "and sum above zero."
+            )
+        weights = torch.as_tensor(
+            joint_weights, dtype=squared_error.dtype, device=squared_error.device
+        )
+        mean_squared_error = (squared_error * weights).sum(dim=-1) / weights.sum()
+
+    return torch.exp(-mean_squared_error / (std * std))
+
+
+def tracking_rby1_relative_body_linvel_error(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    body_names: list[str] | None = None,
+) -> torch.Tensor:
+    """Track articulated link velocity without double-counting base motion.
+
+    The stock world-frame body-velocity term asks every upper-body link to
+    reproduce the reference root's lateral slide. A differential-drive base
+    cannot do that. This term removes anchor translation and rigid-body
+    transport from both trajectories, then compares the remaining articulated
+    velocity in each trajectory's heading frame.
+    """
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    tracked = _get_body_indexes(command, body_names)
+    num_bodies = len(tracked)
+
+    ref_offset = command.body_pos_w[:, tracked] - command.anchor_pos_w[:, None, :]
+    robot_offset = (
+        command.robot_body_pos_w[:, tracked] - command.robot_anchor_pos_w[:, None, :]
+    )
+    ref_transport = torch.cross(
+        command.anchor_ang_vel_w[:, None, :].expand(-1, num_bodies, -1),
+        ref_offset,
+        dim=-1,
+    )
+    robot_transport = torch.cross(
+        command.robot_anchor_ang_vel_w[:, None, :].expand(-1, num_bodies, -1),
+        robot_offset,
+        dim=-1,
+    )
+    ref_relative_w = (
+        command.body_lin_vel_w[:, tracked]
+        - command.anchor_lin_vel_w[:, None, :]
+        - ref_transport
+    )
+    robot_relative_w = (
+        command.robot_body_lin_vel_w[:, tracked]
+        - command.robot_anchor_lin_vel_w[:, None, :]
+        - robot_transport
+    )
+
+    ref_heading = get_heading_q(command.anchor_quat_w)[:, None, :].expand(
+        -1, num_bodies, -1
+    )
+    robot_heading = get_heading_q(command.robot_anchor_quat_w)[:, None, :].expand(
+        -1, num_bodies, -1
+    )
+    ref_relative_h = quat_apply(quat_inv(ref_heading), ref_relative_w)
+    robot_relative_h = quat_apply(quat_inv(robot_heading), robot_relative_w)
+    error = (ref_relative_h - robot_relative_h).square().sum(dim=-1).mean(dim=-1)
+    return torch.exp(-error / (std * std))
+
+
+def tracking_rby1_relative_body_angvel_error(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    body_names: list[str] | None = None,
+) -> torch.Tensor:
+    """Track upper-body angular velocity relative to the moving base."""
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    tracked = _get_body_indexes(command, body_names)
+    num_bodies = len(tracked)
+
+    ref_relative_w = (
+        command.body_ang_vel_w[:, tracked] - command.anchor_ang_vel_w[:, None, :]
+    )
+    robot_relative_w = (
+        command.robot_body_ang_vel_w[:, tracked]
+        - command.robot_anchor_ang_vel_w[:, None, :]
+    )
+    ref_heading = get_heading_q(command.anchor_quat_w)[:, None, :].expand(
+        -1, num_bodies, -1
+    )
+    robot_heading = get_heading_q(command.robot_anchor_quat_w)[:, None, :].expand(
+        -1, num_bodies, -1
+    )
+    ref_relative_h = quat_apply(quat_inv(ref_heading), ref_relative_w)
+    robot_relative_h = quat_apply(quat_inv(robot_heading), robot_relative_w)
+    error = (ref_relative_h - robot_relative_h).square().sum(dim=-1).mean(dim=-1)
+    return torch.exp(-error / (std * std))
+
+
+def tracking_rby1_wheel_velocity_error(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    joint_names: list[str] | None = None,
+) -> torch.Tensor:
+    """Track RBY1 drive-wheel velocities by name across model orderings."""
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    joint_names = joint_names or ["right_wheel", "left_wheel"]
+
+    mapping = env.cfg.isaaclab_to_mujoco_mapping
+    reference_names = mapping.get("mujoco_dof_names")
+    if reference_names is None:
+        raise ValueError("RBY1 wheel reward requires 'mujoco_dof_names' in the robot mapping.")
+
+    missing_reference = [name for name in joint_names if name not in reference_names]
+    missing_robot = [name for name in joint_names if name not in command.robot.joint_names]
+    if missing_reference or missing_robot:
+        raise ValueError(
+            "Could not resolve RBY1 wheel reward joints. "
+            f"Missing reference={missing_reference}, robot={missing_robot}."
+        )
+
+    reference_indices = [reference_names.index(name) for name in joint_names]
+    robot_indices = [command.robot.joint_names.index(name) for name in joint_names]
+    error = command.joint_vel[:, reference_indices] - command.robot_joint_vel[:, robot_indices]
+    return torch.exp(-error.square().mean(dim=-1) / (std * std))
 
 
 def upright_penalty(
@@ -333,36 +575,62 @@ def tracking_local_vr_3point_error(
     return torch.exp(-weighted_error / std**2)
 
 
-def tracking_local_vr_5point_error(env: ManagerBasedRLEnv, command_name: str, std: float):
-    """Compute VR 5-point tracking reward in the anchor's local frame.
-
-    Same approach as tracking_local_vr_3point_error but with 5 tracking points
-    (e.g., 2 wrists + head + 2 feet).
+def tracking_local_reward_points_error(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    point_weights: list[float] | None = None,
+) -> torch.Tensor:
+    """Track an arbitrary configured set of reward points in anchor-local space.
 
     Args:
         env: The environment.
         command_name: Name of the tracking command term.
         std: Standard deviation for the Gaussian kernel.
+        point_weights: Optional weight per configured reward point.
 
     Returns:
         Reward tensor of shape (num_envs,) in [0, 1].
     """
     command: TrackingCommand = env.command_manager.get_term(command_name)
-    ref_5point_diff = command.reward_point_body_pos_w - command.anchor_pos_w[:, None, :]
+    ref_points_diff = command.reward_point_body_pos_w - command.anchor_pos_w[:, None, :]
     ref_root_quat = command.anchor_quat_w.view(env.num_envs, 1, 4).repeat(
         1, len(command.cfg.reward_point_body), 1
     )
-    ref_5point_pos = quat_apply(quat_inv(ref_root_quat), ref_5point_diff)
+    ref_points_pos = quat_apply(quat_inv(ref_root_quat), ref_points_diff)
     robot_root_quat = command.robot_anchor_quat_w.view(env.num_envs, 1, 4).repeat(
         1, len(command.cfg.reward_point_body), 1
     )
-    robot_5point_diff = (
+    robot_points_diff = (
         command.robot_reward_point_body_pos_w - command.robot_anchor_pos_w[:, None, :]
     )
-    robot_5point_pos = quat_apply(quat_inv(robot_root_quat), robot_5point_diff)
-    diff = robot_5point_pos - ref_5point_pos
+    robot_points_pos = quat_apply(quat_inv(robot_root_quat), robot_points_diff)
+    diff = robot_points_pos - ref_points_pos
     error = torch.sum(torch.square(diff), dim=-1)
-    return torch.exp(-error.mean(-1) / std**2)
+    if point_weights is None:
+        mean_error = error.mean(dim=-1)
+    else:
+        if len(point_weights) != error.shape[-1]:
+            raise ValueError(
+                f"Expected {error.shape[-1]} reward-point weights, got {len(point_weights)}."
+            )
+        if (
+            any(not math.isfinite(weight) or weight < 0.0 for weight in point_weights)
+            or sum(point_weights) <= 0.0
+        ):
+            raise ValueError(
+                "Reward-point weights must be finite, non-negative, and sum above zero."
+            )
+        weights = torch.as_tensor(point_weights, dtype=error.dtype, device=error.device)
+        mean_error = (error * weights).sum(dim=-1) / weights.sum()
+    return torch.exp(-mean_error / std**2)
+
+
+def tracking_local_vr_5point_error(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Backward-compatible wrapper for the historical five-point reward."""
+    return tracking_local_reward_points_error(env, command_name, std)
 
 
 def tracking_vr_3point_error_pos_force(

@@ -35,6 +35,7 @@ class TerminationsCfg:
     anchor_pos = None
     anchor_ori = None
     anchor_ori_full = None
+    anchor_tilt = None
     ee_body_pos = None
     anchor_pos_xy = None
     foot_pos_xyz = None

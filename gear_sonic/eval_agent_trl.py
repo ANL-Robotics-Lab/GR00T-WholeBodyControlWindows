@@ -233,7 +233,7 @@ def main(override_config: omegaconf.OmegaConf):
         args_cli.device = device
 
         base_kit_args = (
-            "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error"
+            "--/app/vulkan=false --/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error"
         )
         if args_cli.headless:
             args_cli.kit_args = base_kit_args + " --no-window"

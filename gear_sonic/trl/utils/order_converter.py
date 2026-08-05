@@ -205,17 +205,23 @@ class RBY1Converter(IsaacLabMuJoCoConverter):
     """RBY1 robot joint/body order converter between IsaacLab and MuJoCo conventions."""
 
     def __init__(self):
-        # Lazy import to avoid circular dependency:
-        # order_converter -> rby1 -> mdp/__init__ -> commands -> order_converter
-        from gear_sonic.envs.manager_env.robots.rby1 import (
-            RBY1_ISAACLAB_JOINTS,
+        # This dependency-free module is shared with the simulator config and
+        # CSV converter, so their ordering cannot drift independently.
+        from gear_sonic.utils.rby1_order import (
+            RBY1_ISAACLAB_BODY_NAMES_25,
+            RBY1_ISAACLAB_DOF_NAMES,
             RBY1_ISAACLAB_TO_MUJOCO_BODY,
             RBY1_ISAACLAB_TO_MUJOCO_DOF,
+            RBY1_MUJOCO_BODY_NAMES,
+            RBY1_MUJOCO_DOF_NAMES,
             RBY1_MUJOCO_TO_ISAACLAB_BODY,
             RBY1_MUJOCO_TO_ISAACLAB_DOF,
         )
 
-        self.JOINT_NAMES = RBY1_ISAACLAB_JOINTS
+        self.JOINT_NAMES = RBY1_ISAACLAB_DOF_NAMES
+        self.MUJOCO_JOINT_NAMES = RBY1_MUJOCO_DOF_NAMES
+        self.BODY_NAMES = RBY1_ISAACLAB_BODY_NAMES_25
+        self.MUJOCO_BODY_NAMES = RBY1_MUJOCO_BODY_NAMES
 
         self.DOF_MAPPINGS = {
             ("isaaclab", "mujoco"): RBY1_ISAACLAB_TO_MUJOCO_DOF,
@@ -247,15 +253,13 @@ class RBY1Converter(IsaacLabMuJoCoConverter):
 
     @property
     def vr_3points_mujoco_indices(self):
-        """VR 3-point body indices in full MuJoCo body order."""
-        mj_names = [self.JOINT_NAMES[i] for i in self.isaaclab_to_mujoco_body]
-        return [mj_names.index(n) for n in self.VR_3POINTS_BODY_NAMES]
+        """VR 3-point body indices in collapsed MuJoCo body order."""
+        return [self.MUJOCO_BODY_NAMES.index(n) for n in self.VR_3POINTS_BODY_NAMES]
 
     @property
     def foot_mujoco_indices(self):
-        """Wheel/support-body indices in full MuJoCo body order."""
-        mj_names = [self.JOINT_NAMES[i] for i in self.isaaclab_to_mujoco_body]
-        return [mj_names.index(n) for n in self.FOOT_BODY_NAMES]
+        """Wheel/support-body indices in collapsed MuJoCo body order."""
+        return [self.MUJOCO_BODY_NAMES.index(n) for n in self.FOOT_BODY_NAMES]
 
     @property
     def isaaclab_to_mujoco_dof(self):
@@ -281,6 +285,9 @@ class RBY1Converter(IsaacLabMuJoCoConverter):
         """Return the full mapping dict for body/DOF reordering."""
         return {
             "isaaclab_joints": self.JOINT_NAMES,
+            "mujoco_joints": self.MUJOCO_JOINT_NAMES,
+            "isaaclab_body_names": self.BODY_NAMES,
+            "mujoco_body_names": self.MUJOCO_BODY_NAMES,
             "isaaclab_to_mujoco_dof": self.isaaclab_to_mujoco_dof,
             "mujoco_to_isaaclab_dof": self.mujoco_to_isaaclab_dof,
             "isaaclab_to_mujoco_body": self.isaaclab_to_mujoco_body,

@@ -67,6 +67,27 @@ def _init_variable_frames(
     return per_env_num_frames, frame_choices
 
 
+def _resolve_name_indices(
+    names: Sequence[str], available_names: Sequence[str], label: str
+) -> list[int]:
+    """Resolve names to indices with an error that shows the missing entries."""
+    missing = [name for name in names if name not in available_names]
+    if missing:
+        raise ValueError(
+            f"Could not resolve {label} names {missing}. Available names: {list(available_names)}"
+        )
+    return [available_names.index(name) for name in names]
+
+
+def _motion_body_names_from_mapping(mapping: dict) -> Sequence[str]:
+    """Return IsaacLab-ordered motion-lib body names, falling back to legacy keys."""
+    return (
+        mapping.get("isaaclab_body_names_25")
+        or mapping.get("isaaclab_body_names")
+        or mapping["isaaclab_joints"]
+    )
+
+
 @configclass
 class CommandsCfg:
     """Command specifications for the MDP."""
@@ -132,6 +153,7 @@ class TrackingCommand(CommandTerm):
         self.is_evaluating = False
         self.cmd_body_names = self.cfg.body_names
         self.robot: Articulation = env.scene[cfg.asset_name]
+        isaaclab_to_mujoco_mapping = env.cfg.isaaclab_to_mujoco_mapping
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body)
         self.motion_anchor_body_index = self.cfg.body_names.index(self.cfg.anchor_body)
         self.vr_3point_body_indices = [
@@ -169,20 +191,44 @@ class TrackingCommand(CommandTerm):
             device=self.device,
         )
 
-        isaac_lab_joints = env.cfg.isaaclab_to_mujoco_mapping["isaaclab_joints"]
+        motion_body_names = _motion_body_names_from_mapping(isaaclab_to_mujoco_mapping)
 
-        self.isaaclab_to_mujoco_dof = env.cfg.isaaclab_to_mujoco_mapping["isaaclab_to_mujoco_dof"]
-        self.mujoco_to_isaaclab_dof = env.cfg.isaaclab_to_mujoco_mapping["mujoco_to_isaaclab_dof"]
+        self.isaaclab_to_mujoco_dof = isaaclab_to_mujoco_mapping["isaaclab_to_mujoco_dof"]
+        self.mujoco_to_isaaclab_dof = isaaclab_to_mujoco_mapping["mujoco_to_isaaclab_dof"]
+        motion_to_isaaclab_dof_sign = isaaclab_to_mujoco_mapping.get(
+            "motion_to_isaaclab_dof_sign"
+        )
+        if motion_to_isaaclab_dof_sign is None:
+            self.motion_to_isaaclab_dof_sign = None
+        else:
+            expected_dof_count = len(
+                isaaclab_to_mujoco_mapping.get(
+                    "mujoco_dof_names", self.isaaclab_to_mujoco_dof
+                )
+            )
+            if len(motion_to_isaaclab_dof_sign) != expected_dof_count:
+                raise ValueError(
+                    "motion_to_isaaclab_dof_sign must have one entry per motion DOF: "
+                    f"expected {expected_dof_count}, got "
+                    f"{len(motion_to_isaaclab_dof_sign)}."
+                )
+            self.motion_to_isaaclab_dof_sign = torch.tensor(
+                motion_to_isaaclab_dof_sign,
+                dtype=torch.float32,
+                device=self.device,
+            )
         self.lower_joint_indices_mujoco = list(range(12))
         self.lower_joint_isaaclab_indices = [
             self.isaaclab_to_mujoco_dof[i] for i in self.lower_joint_indices_mujoco
         ]
-        self.isaaclab_to_mujoco_body = env.cfg.isaaclab_to_mujoco_mapping["isaaclab_to_mujoco_body"]
-        self.mujoco_to_isaaclab_body = env.cfg.isaaclab_to_mujoco_mapping["mujoco_to_isaaclab_body"]
+        self.isaaclab_to_mujoco_body = isaaclab_to_mujoco_mapping["isaaclab_to_mujoco_body"]
+        self.mujoco_to_isaaclab_body = isaaclab_to_mujoco_mapping["mujoco_to_isaaclab_body"]
         self.running_ref_root_height = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device
         )
-        self.body_indexes_data = [isaac_lab_joints.index(name) for name in self.cfg.body_names]
+        self.body_indexes_data = _resolve_name_indices(
+            self.cfg.body_names, motion_body_names, "motion body"
+        )
         if self.cfg.motion_lib_cfg is not None:
             motion_lib_cfg = easydict.EasyDict(self.cfg.motion_lib_cfg)
         else:
@@ -1670,6 +1716,31 @@ class TrackingCommand(CommandTerm):
             self.motion_ids, self.motion_start_time_steps + self.time_steps, hand=hand
         )
 
+    def _use_raw_motion_dof(self) -> bool:
+        """Use PKL ``dof`` directly for RBY1's MuJoCo-order policy joints."""
+        return (
+            self.has_dof_mismatch
+            and "right_wheel" in self.robot.joint_names
+            and hasattr(self.motion_lib, "get_raw_dof_pos")
+        )
+
+    def convert_raw_motion_dof_to_robot(self, values: torch.Tensor) -> torch.Tensor:
+        """Convert raw motion coordinates to the loaded articulation's axis signs.
+
+        Ordering remains unchanged (motion-library / MuJoCo order).  RBY1 uses
+        this to invert its two wheel coordinates because the FK MJCF and the
+        dynamic USD define those revolute axes in opposite directions.
+        """
+        signs = getattr(self, "motion_to_isaaclab_dof_sign", None)
+        if signs is None:
+            return values
+        if values.shape[-1] != signs.numel():
+            raise ValueError(
+                "Raw motion DOF sign conversion shape mismatch: "
+                f"values have {values.shape[-1]} DOFs, signs have {signs.numel()}."
+            )
+        return values * signs.to(dtype=values.dtype)
+
     @property
     def joint_pos(self) -> torch.Tensor:
         """Return reference joint positions for the current frame.
@@ -1677,6 +1748,12 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_dof)``.
         """
+        if self._use_raw_motion_dof():
+            return self.convert_raw_motion_dof_to_robot(
+                self.motion_lib.get_raw_dof_pos(
+                    self.motion_ids, self.motion_start_time_steps + self.time_steps
+                )
+            )
         return self.motion_lib.get_dof_pos(
             self.motion_ids, self.motion_start_time_steps + self.time_steps
         )
@@ -1688,18 +1765,37 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_future_frames * num_dof)``.
         """
+        if self._use_raw_motion_dof():
+            return self.convert_raw_motion_dof_to_robot(
+                self.motion_lib.get_raw_dof_pos(
+                    self.future_motion_ids, self.future_time_steps
+                )
+            ).view(self.num_envs, -1)
         return self.motion_lib.get_dof_pos(self.future_motion_ids, self.future_time_steps).view(
             self.num_envs, -1
         )
 
     @property
     def joint_pos_multi_future_for_smpl(self) -> torch.Tensor:
+        if self._use_raw_motion_dof():
+            return self.convert_raw_motion_dof_to_robot(
+                self.motion_lib.get_raw_dof_pos(
+                    self.smpl_future_motion_ids, self.smpl_future_time_steps
+                )
+            ).view(self.num_envs, -1)
         return self.motion_lib.get_dof_pos(
             self.smpl_future_motion_ids, self.smpl_future_time_steps
         ).view(self.num_envs, -1)
 
     @property
     def joint_pos_lower_body_multi_future(self) -> torch.Tensor:
+        if self._use_raw_motion_dof():
+            raw_pos = self.convert_raw_motion_dof_to_robot(
+                self.motion_lib.get_raw_dof_pos(
+                    self.future_motion_ids, self.future_time_steps
+                )
+            )
+            return raw_pos[..., self.lower_joint_indices_mujoco].view(self.num_envs, -1)
         return self.motion_lib.get_dof_pos(self.future_motion_ids, self.future_time_steps)[
             ..., self.lower_joint_isaaclab_indices
         ].view(self.num_envs, -1)
@@ -1711,6 +1807,12 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_dof)``.
         """
+        if self._use_raw_motion_dof():
+            return self.convert_raw_motion_dof_to_robot(
+                self.motion_lib.get_raw_dof_vel(
+                    self.motion_ids, self.motion_start_time_steps + self.time_steps
+                )
+            )
         return self.motion_lib.get_dof_vel(
             self.motion_ids, self.motion_start_time_steps + self.time_steps
         )
@@ -1722,6 +1824,12 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_future_frames * num_dof)``.
         """
+        if self._use_raw_motion_dof():
+            return self.convert_raw_motion_dof_to_robot(
+                self.motion_lib.get_raw_dof_vel(
+                    self.future_motion_ids, self.future_time_steps
+                )
+            ).view(self.num_envs, -1)
         return self.motion_lib.get_dof_vel(self.future_motion_ids, self.future_time_steps).view(
             self.num_envs, -1
         )
@@ -1752,6 +1860,13 @@ class TrackingCommand(CommandTerm):
 
     @property
     def joint_vel_lower_body_multi_future(self) -> torch.Tensor:
+        if self._use_raw_motion_dof():
+            raw_vel = self.convert_raw_motion_dof_to_robot(
+                self.motion_lib.get_raw_dof_vel(
+                    self.future_motion_ids, self.future_time_steps
+                )
+            )
+            return raw_vel[..., self.lower_joint_indices_mujoco].view(self.num_envs, -1)
         return self.motion_lib.get_dof_vel(self.future_motion_ids, self.future_time_steps)[
             ..., self.lower_joint_isaaclab_indices
         ].view(self.num_envs, -1)

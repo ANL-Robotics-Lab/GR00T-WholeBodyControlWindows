@@ -1,0 +1,192 @@
+# RBY1-specific motion tracking reward composition.
+#
+# RBY1 has a planar differential-drive base plus a six-joint torso, two
+# seven-joint arms, and a two-joint head. It should not inherit humanoid foot
+# rewards or full floating-root position/orientation rewards.
+
+defaults:
+  - terms/tracking_relative_body_pos@_here_
+  - terms/tracking_relative_body_ori@_here_
+  - terms/action_rate_l2@_here_
+  - terms/joint_limit@_here_
+  - terms/undesired_contacts@_here_
+
+_target_: gear_sonic.envs.manager_env.mdp.rewards.RewardsCfg
+
+tracking_planar_anchor_pos:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:tracking_planar_anchor_pos_error
+  # Keep enough absolute planar tracking to retain the corrected base direction,
+  # without letting this easy term dominate the articulated dance pose.
+  weight: 0.25
+  params:
+    command_name: motion
+    std: 0.3
+
+tracking_anchor_yaw:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:tracking_anchor_yaw_error
+  weight: 0.15
+  params:
+    command_name: motion
+    std: 0.4
+
+tracking_base_forward_vel:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:tracking_rby1_forward_velocity_error
+  weight: 0.1
+  params:
+    command_name: motion
+    std: 0.5
+
+tracking_base_yaw_rate:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:tracking_rby1_yaw_rate_error
+  weight: 0.05
+  params:
+    command_name: motion
+    std: 1.5
+
+# Compare only articulated upper-body velocity relative to the moving base.
+# World-frame link velocities would reintroduce the source root's discarded
+# lateral slide and duplicate the dedicated forward/yaw-rate objectives.
+tracking_body_linvel:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:tracking_rby1_relative_body_linvel_error
+  # The slowed clip makes near-zero relative velocities easy to match. Treat
+  # velocity as supporting smoothness rather than the main imitation target.
+  weight: 0.15
+  params:
+    command_name: motion
+    std: 1.0
+
+tracking_body_angvel:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:tracking_rby1_relative_body_angvel_error
+  weight: 0.15
+  params:
+    command_name: motion
+    std: 3.14
+
+# Directly supervise the 22 position-controlled motion joints. The broad
+# kernel remains informative at the roughly 1.2-rad mean error observed early
+# in training, while the 4.0 term weight is five times the 0.8 combined maximum
+# of all base/wheel rewards below. Torso joints receive twice the per-joint
+# weight so folding the trunk cannot be traded for easier arm or base rewards.
+tracking_upper_body_joint_pos:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:tracking_rby1_joint_pos_error
+  weight: 4.0
+  params:
+    command_name: motion
+    std: 1.5
+    joint_names:
+      - torso_0
+      - torso_1
+      - torso_2
+      - torso_3
+      - torso_4
+      - torso_5
+      - right_arm_0
+      - right_arm_1
+      - right_arm_2
+      - right_arm_3
+      - right_arm_4
+      - right_arm_5
+      - right_arm_6
+      - left_arm_0
+      - left_arm_1
+      - left_arm_2
+      - left_arm_3
+      - left_arm_4
+      - left_arm_5
+      - left_arm_6
+      - head_0
+      - head_1
+    joint_weights:
+      - 2.0
+      - 2.0
+      - 2.0
+      - 2.0
+      - 2.0
+      - 2.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 0.5
+      - 0.5
+
+tracking_upper_body_points:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:tracking_local_reward_points_error
+  # Use a broad first-stage kernel so arm/torso errors still produce a useful
+  # gradient. Tighten this later with a curriculum once tracking has converged.
+  weight: 3.0
+  params:
+    command_name: motion
+    std: 0.3
+    # reward_point_body is [upper torso/head proxy, left tool, right tool].
+    point_weights: [1.0, 2.0, 2.0]
+
+tracking_wheel_vel:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:tracking_rby1_wheel_velocity_error
+  weight: 0.25
+  params:
+    command_name: motion
+    std: 3.0
+    joint_names: [right_wheel, left_wheel]
+
+# The source has a few fast retargeting transitions. Smoothing the trainable
+# clip handles those directly; a lighter action-rate cost then discourages
+# policy jitter without overwhelming legitimate dance transitions.
+action_rate_l2:
+  weight: -3.0e-2
+
+wheel_acc:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:joint_acc_l2
+  weight: -2.5e-8
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: robot
+      joint_names: [right_wheel, left_wheel]
+
+# Damp roll/pitch motion of the floating base without suppressing commanded
+# yaw. This gives the policy a direct signal before a forward lean becomes a
+# fallen episode.
+anti_tip_ang_vel:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: isaaclab.envs.mdp:ang_vel_xy_l2
+  weight: -0.1
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: robot
+
+upright_penalty:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:upright_penalty
+  weight: -5.0
+  params:
+    command_name: motion
+    body_names: [base]
+
+# Isaac Lab excludes timeouts from this signal, so completing the dance is not
+# penalized; only early falls/drift failures receive the terminal cost.
+is_terminated:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: isaaclab.envs.mdp:is_terminated
+  weight: -200.0

@@ -17,117 +17,132 @@
 #   For a 24-DOF RBY1 training embodiment, that means 24 or 25 bodies.
 #
 # IMPORTANT:
-#   The mapping arrays below are derived from:
-#     - IsaacLab-style breadth-first articulated traversal inferred from the
-#       G1 config pattern
-#     - MuJoCo depth-first active-joint order in the uploaded RBY1 XML,
-#       with finger joints omitted for the 24-DOF baseline
-#
-#   NVIDIA recommends verifying the actual IsaacLab body_names/joint_names
-#   after importing your URDF. Do that before launching long training runs.
+#   The mapping arrays below are updated from your Isaac Sim dynamic_control
+#   articulation log for /World/envs/env_0/Robot/model. The imported USD has
+#   38 bodies, not the 25 collapsed bodies assumed by the first draft.
+#   For SONIC motion matching, filter the full body tensor to the 25 selected
+#   bodies before applying collapsed-body mapping/reward logic.
 
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 import isaaclab.sim as sim_utils
 
+from gear_sonic.utils.rby1_order import (
+    RBY1_FULL_BODY_TO_COLLAPSED_25,
+    RBY1_FULL_ISAACLAB_BODY_NAMES,
+    RBY1_FULL_ISAACLAB_TO_MUJOCO_BODY,
+    RBY1_ISAACLAB_BODY_NAMES_25,
+    RBY1_ISAACLAB_DOF_NAMES,
+    RBY1_ISAACLAB_TO_MUJOCO_BODY,
+    RBY1_ISAACLAB_TO_MUJOCO_DOF,
+    RBY1_MOTION_TO_ISAACLAB_DOF_SIGN,
+    RBY1_MUJOCO_BODY_NAMES,
+    RBY1_MUJOCO_DOF_NAMES,
+    RBY1_MUJOCO_TO_ISAACLAB_BODY,
+    RBY1_MUJOCO_TO_ISAACLAB_DOF,
+    RBY1_POSITION_ACTION_SCALE,
+)
+
 ASSET_DIR = "gear_sonic/data/assets"
 
 # ---------------------------------------------------------------------
-# 1) BODY ORDERING — IsaacLab traversal order, 25 bodies total
+# 1) ORDERING — verified from your Isaac Sim dynamic_control log
+# ---------------------------------------------------------------------
+# The imported USD is NOT the collapsed 25-body training model assumed in
+# the first draft.  The actual PhysX articulation log shows 38 links, with
+# caster/backwheel, axle, FT sensor, end-effector, and finger bodies inserted
+# into the tree.  The 24-DOF policy embodiment below therefore uses:
+#   - 24 selected actuated joints for policy / motion-lib DOFs
+#   - a 25-body collapsed subset for SONIC motion matching
+#   - an explicit full-body selector when the source tensor is the full 38-body
+#     Isaac articulation tensor.
+#
+# IMPORTANT BODY TENSOR RULE:
+#   If your tensor is full Isaac body state with 38 bodies, first select:
+#       body_state_25 = body_state_full[:, RBY1_FULL_BODY_TO_COLLAPSED_25, ...]
+#   Then apply the 25-body reorder arrays if your SONIC code expects them.
 # ---------------------------------------------------------------------
 
-RBY1_ISAACLAB_JOINTS = [
-    "base",
-    "wheel_r",
-    "wheel_l",
-    "link_torso_0",
-    "link_torso_1",
-    "link_torso_2",
-    "link_torso_3",
-    "link_torso_4",
-    "link_torso_5",
-    "link_right_arm_0",
-    "link_left_arm_0",
-    "link_head_1",
-    "link_right_arm_1",
-    "link_left_arm_1",
-    "link_head_2",
-    "link_right_arm_2",
-    "link_left_arm_2",
-    "link_right_arm_3",
-    "link_left_arm_3",
-    "link_right_arm_4",
-    "link_left_arm_4",
-    "link_right_arm_5",
-    "link_left_arm_5",
-    "link_right_arm_6",
-    "link_left_arm_6",
+# Backward-compatible alias for code that still expects this key/name.
+# NOTE: this is now DOF names, not body names.
+RBY1_ISAACLAB_JOINTS = RBY1_ISAACLAB_DOF_NAMES
+
+# Full-joint names printed alongside the 38 links.  Several are fixed or passive
+# and are intentionally not part of the 24-DOF policy embodiment.
+RBY1_FULL_ISAACLAB_JOINT_NAMES = [
+    None,
+    "left_wheel",
+    "torso_0",
+    "Axil1",
+    "Axil2",
+    "right_wheel",
+    "torso_1",
+    "backwheel",
+    "backwheel2",
+    "torso_2",
+    "torso_3",
+    "torso_4",
+    "torso_5",
+    "head_base",
+    "left_arm_0",
+    "right_arm_0",
+    "head_0",
+    "left_arm_1",
+    "right_arm_1",
+    "head_1",
+    "left_arm_2",
+    "right_arm_2",
+    "left_arm_3",
+    "right_arm_3",
+    "left_arm_4",
+    "right_arm_4",
+    "left_arm_5",
+    "right_arm_5",
+    "left_arm_6",
+    "right_arm_6",
+    "tool_left",
+    "tool_right",
+    "FT_Sensor_END_left",
+    "FT_Sensor_END_right",
+    "FixedJoint",
+    "FixedJoint0",
+    "gripper_finger_r1",
+    "gripper_finger_r2",
 ]
 
 # ---------------------------------------------------------------------
-# 2) DOF ORDERING — 24 DOFs
-#
-# IsaacLab inferred order:
-#   right_wheel, left_wheel, torso_0..5,
-#   right_arm_0, left_arm_0, head_0,
-#   right_arm_1, left_arm_1, head_1,
-#   right_arm_2, left_arm_2, ...,
-#   right_arm_6, left_arm_6
-#
-# MuJoCo active-joint order used here:
-#   right_wheel, left_wheel, torso_0..5,
-#   right_arm_0..6, left_arm_0..6, head_0, head_1
+# 2) DOF MAPPINGS — 24 selected DOFs
 #
 # Mapping convention follows GR00T:
 #   output[i] = input[mapping[i]]
 # ---------------------------------------------------------------------
 
-RBY1_ISAACLAB_TO_MUJOCO_DOF = [
-    0, 1, 2, 3, 4, 5, 6, 7,
-    8, 11, 14, 16, 18, 20, 22,
-    9, 12, 15, 17, 19, 21, 23,
-    10, 13,
-]
-
-RBY1_MUJOCO_TO_ISAACLAB_DOF = [
-    0, 1, 2, 3, 4, 5, 6, 7,
-    8, 15, 22, 9, 16, 23, 10,
-    17, 11, 18, 12, 19, 13, 20,
-    14, 21,
-]
-
 # ---------------------------------------------------------------------
-# 3) BODY MAPPINGS — 25 bodies
+# 3) BODY MAPPINGS — 25 selected/collapsed bodies
 #
-# Collapsed MuJoCo body order used here:
-#   base,
-#   wheel_r, wheel_l,
-#   link_torso_0..5,
-#   link_right_arm_0..6,
-#   link_left_arm_0..6,
-#   link_head_1, link_head_2
+# If the tensor has full Isaac body order, use RBY1_FULL_ISAACLAB_TO_MUJOCO_BODY.
+# If the tensor has already been filtered to RBY1_ISAACLAB_BODY_NAMES_25 order,
+# use RBY1_ISAACLAB_TO_MUJOCO_BODY and RBY1_MUJOCO_TO_ISAACLAB_BODY below.
 # ---------------------------------------------------------------------
-
-RBY1_ISAACLAB_TO_MUJOCO_BODY = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8,
-    9, 12, 15, 17, 19, 21, 23,
-    10, 13, 16, 18, 20, 22, 24,
-    11, 14,
-]
-
-RBY1_MUJOCO_TO_ISAACLAB_BODY = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8,
-    9, 16, 23, 10, 17, 24, 11,
-    18, 12, 19, 13, 20, 14, 21,
-    15, 22,
-]
 
 RBY1_ISAACLAB_TO_MUJOCO_MAPPING = {
-    "isaaclab_joints": RBY1_ISAACLAB_JOINTS,
+    # Backward-compatible GR00T/SONIC keys.
+    "isaaclab_joints": RBY1_ISAACLAB_DOF_NAMES,
     "isaaclab_to_mujoco_dof": RBY1_ISAACLAB_TO_MUJOCO_DOF,
     "mujoco_to_isaaclab_dof": RBY1_MUJOCO_TO_ISAACLAB_DOF,
     "isaaclab_to_mujoco_body": RBY1_ISAACLAB_TO_MUJOCO_BODY,
     "mujoco_to_isaaclab_body": RBY1_MUJOCO_TO_ISAACLAB_BODY,
+
+    # New explicit names/selectors for your non-collapsed USD.
+    "isaaclab_dof_names": RBY1_ISAACLAB_DOF_NAMES,
+    "mujoco_dof_names": RBY1_MUJOCO_DOF_NAMES,
+    # PKL/clean-MJCF wheel axes are -Y; the loaded USD wheel axes are +Y.
+    "motion_to_isaaclab_dof_sign": RBY1_MOTION_TO_ISAACLAB_DOF_SIGN,
+    "isaaclab_body_names_25": RBY1_ISAACLAB_BODY_NAMES_25,
+    "mujoco_body_names": RBY1_MUJOCO_BODY_NAMES,
+    "full_isaaclab_body_names": RBY1_FULL_ISAACLAB_BODY_NAMES,
+    "full_body_to_collapsed_25": RBY1_FULL_BODY_TO_COLLAPSED_25,
+    "full_isaaclab_to_mujoco_body": RBY1_FULL_ISAACLAB_TO_MUJOCO_BODY,
 }
 
 # ---------------------------------------------------------------------
@@ -177,6 +192,13 @@ STIFFNESS_HEAD = _kp(ARMATURE_HEAD)
 DAMPING_HEAD = _kd(ARMATURE_HEAD)
 
 WHEEL_EFFORT_LIMIT = 120.0  # TODO: replace with RBY1 wheel actuator spec
+WHEEL_VELOCITY_LIMIT = 15.707963268
+# Normalized action +/-1 maps to +/-10 rad/s. This covers the smoothed,
+# slowed dance reference while leaving margin below the simulated drive limit.
+RBY1_WHEEL_ACTION_SCALE = 10.0
+# Velocity feedback gain: a 10 rad/s error can request the available 120 Nm.
+# The simulator's effort limit still provides the final torque clamp.
+RBY1_WHEEL_VELOCITY_DAMPING = WHEEL_EFFORT_LIMIT / RBY1_WHEEL_ACTION_SCALE
 
 # ---------------------------------------------------------------------
 # 5) ISAAC LAB ARTICULATION CONFIG
@@ -184,7 +206,7 @@ WHEEL_EFFORT_LIMIT = 120.0  # TODO: replace with RBY1 wheel actuator spec
 
 RBY1_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path="C:/Users/bcarc_ziwaj0x/Downloads/TransuranicVer/GantrySystemV4/Collected_simplifiedTWPC/flatremovedRBY2.usd",
+        usd_path="C:/Users/bcarc_ziwaj0x/Downloads/TransuranicVer/GantrySystemV4/Collected_simplifiedTWPC/flatremovedRBY3.usd",
         activate_contact_sensors=True,
         # collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005, rest_offset=0.0),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -213,11 +235,13 @@ RBY1_CFG = ArticulationCfg(
     soft_joint_pos_limit_factor=0.9,
     actuators={
         "wheels": ImplicitActuatorCfg(
-            joint_names_expr=["right_wheel", "left_wheel"],
+            joint_names_expr=["left_wheel", "right_wheel"],
             effort_limit_sim=WHEEL_EFFORT_LIMIT,
-            velocity_limit_sim=15.707963268,
-            stiffness=STIFFNESS_WHEEL,
-            damping=DAMPING_WHEEL,
+            velocity_limit_sim=WHEEL_VELOCITY_LIMIT,
+            # A non-zero position gain fights continuously rotating wheel
+            # targets. RBY1MixedJointAction supplies velocity targets instead.
+            stiffness=0.0,
+            damping=RBY1_WHEEL_VELOCITY_DAMPING,
             armature=ARMATURE_WHEEL,
         ),
         "torso_heavy": ImplicitActuatorCfg(
@@ -319,19 +343,16 @@ RBY1_CFG = ArticulationCfg(
 
 # ---------------------------------------------------------------------
 # 6) ACTION SCALE
+#
+# Position targets use an explicit motion-sized normalization. Deriving this
+# from effort / stiffness made distal arm scales as small as 0.119 rad, forcing
+# the policy to emit values around 10-14 to reproduce the reference dance.
+# The explicit values keep the same reference near unit action magnitude.
 # ---------------------------------------------------------------------
 
-RBY1_ACTION_SCALE = {}
-for actuator in RBY1_CFG.actuators.values():
-    effort = actuator.effort_limit_sim
-    stiffness = actuator.stiffness
-    names = actuator.joint_names_expr
+RBY1_ACTION_SCALE = dict(RBY1_POSITION_ACTION_SCALE)
 
-    if not isinstance(effort, dict):
-        effort = dict.fromkeys(names, effort)
-    if not isinstance(stiffness, dict):
-        stiffness = dict.fromkeys(names, stiffness)
-
-    for name in names:
-        if name in effort and name in stiffness and stiffness[name]:
-            RBY1_ACTION_SCALE[name] = 0.25 * effort[name] / stiffness[name]
+# Wheels use velocity rather than position targets, so their action scale is
+# specified directly instead of being derived from effort / position stiffness.
+RBY1_ACTION_SCALE["left_wheel"] = RBY1_WHEEL_ACTION_SCALE
+RBY1_ACTION_SCALE["right_wheel"] = RBY1_WHEEL_ACTION_SCALE

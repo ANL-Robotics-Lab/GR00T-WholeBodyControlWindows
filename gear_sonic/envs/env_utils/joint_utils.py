@@ -6,6 +6,11 @@ between motion library data and robot joints.
 
 import torch
 
+from gear_sonic.utils.rby1_order import (
+    RBY1_ISAACLAB_DOF_NAMES as RBY1_ACTUAL_ISAACLAB_DOF_NAMES,
+    RBY1_MUJOCO_DOF_NAMES as RBY1_MOTIONLIB_BODY_JOINTS,
+)
+
 # G1 body joint names in IsaacLab order (29 DOF)
 G1_ISAACLab_ORDER = [
     "left_hip_pitch_joint",
@@ -39,40 +44,6 @@ G1_ISAACLab_ORDER = [
     "right_wrist_yaw_joint",
 ]
 
-RBY1_BODY_JOINTS = [
-    "right_wheel",
-    "left_wheel",
-    "torso_0",
-    "torso_1",
-    "torso_2",
-    "torso_3",
-    "torso_4",
-    "torso_5",
-    "right_arm_0",
-    "right_arm_1",
-    "right_arm_2",
-    "right_arm_3",
-    "right_arm_4",
-    "right_arm_5",
-    "right_arm_6",
-    "left_arm_0",
-    "left_arm_1",
-    "left_arm_2",
-    "left_arm_3",
-    "left_arm_4",
-    "left_arm_5",
-    "left_arm_6",
-    "head_0",
-    "head_1",
-]
-
-RBY1_EXTRA_JOINTS = [
-    "backwheel",
-    "backwheel2",
-    "gripper_finger_r1",
-    "gripper_finger_r2",
-]
-
 # G1 hand joint names (14 DOF) - order from g1_43dof.yaml
 G1_HAND_JOINTS = [
     "left_hand_index_0_joint",
@@ -94,6 +65,26 @@ G1_HAND_JOINTS = [
 # Caches for joint indices
 _body_joint_indices_cache = {}
 _hand_joint_indices_cache = {}
+
+
+# Backward-compatible alias if other files import RBY1_BODY_JOINTS.
+RBY1_BODY_JOINTS = RBY1_MOTIONLIB_BODY_JOINTS
+
+
+# ---------------------------------------------------------------------
+# Actual selected RBY1 Isaac articulation order from your dynamic_control log
+#
+# This is the filtered 24-policy-DOF order seen in the loaded USD.
+# It excludes Axil/backwheel/fixed/end-effector/gripper extras.
+# ---------------------------------------------------------------------
+
+RBY1_EXTRA_JOINTS = [
+    "backwheel",
+    "backwheel2",
+    "gripper_finger_r1",
+    "gripper_finger_r2",
+]
+
 
 
 def _get_joint_indices_by_names(
@@ -129,21 +120,46 @@ def _get_joint_indices_by_names(
     return indices_tensor
 
 
+
+
 def _is_rby1(asset) -> bool:
-    """Detect RBY1 from the presence of its core motion-library joints."""
-    robot_joint_names = asset.joint_names
-    return any(name in robot_joint_names for name in RBY1_BODY_JOINTS)
+    """Detect RBY1 from a conservative set of core joints."""
+    robot_joint_names = set(asset.joint_names)
+    required = {
+        "left_wheel",
+        "right_wheel",
+        "torso_0",
+        "right_arm_0",
+        "left_arm_0",
+        "head_0",
+    }
+    return required.issubset(robot_joint_names)
 
 
 def get_body_joint_indices(asset) -> torch.Tensor:
-    """Get indices of body joints tracked by the motion library."""
+    """
+    Get body joint indices tracked by the motion library.
+
+    For RBY1, this intentionally returns indices in motion-lib / MuJoCo order,
+    not raw Isaac articulation order. That means:
+
+        asset.data.joint_pos[:, get_body_joint_indices(asset)]
+
+    should line up with:
+
+        motion_lib_entry["dof"]
+
+    which is stored as:
+        right_wheel, left_wheel, torso_0..5,
+        right_arm_0..6, left_arm_0..6, head_0, head_1
+    """
     if _is_rby1(asset):
         return _get_joint_indices_by_names(
             asset,
-            RBY1_BODY_JOINTS,
+            RBY1_MOTIONLIB_BODY_JOINTS,
             _body_joint_indices_cache,
             expected_count=24,
-            label="RBY1 body joints",
+            label="RBY1 motion-lib body joints",
         )
 
     return _get_joint_indices_by_names(
@@ -158,11 +174,18 @@ def get_body_joint_indices(asset) -> torch.Tensor:
 def get_hand_joint_indices(asset) -> torch.Tensor:
     """Get indices of extra joints absent from the motion library."""
     if _is_rby1(asset):
+        available = set(asset.joint_names)
+        existing_extra = [name for name in RBY1_EXTRA_JOINTS if name in available]
+
+        # Do not hard-fail if a cleaned 24-DOF USD removes these joints.
+        if not existing_extra:
+            return torch.empty(0, dtype=torch.long, device=asset.device)
+
         return _get_joint_indices_by_names(
             asset,
-            RBY1_EXTRA_JOINTS,
+            existing_extra,
             _hand_joint_indices_cache,
-            expected_count=4,
+            expected_count=None,
             label="RBY1 extra joints",
         )
 
@@ -172,4 +195,19 @@ def get_hand_joint_indices(asset) -> torch.Tensor:
         _hand_joint_indices_cache,
         expected_count=14,
         label="G1 hand joints",
+    )
+
+def get_rby1_isaaclab_body_joint_indices(asset) -> torch.Tensor:
+    """
+    Get RBY1 policy DOF indices in the actual Isaac articulation order.
+
+    Use this only for code that explicitly wants Isaac-order policy DOFs.
+    Do not use this for direct comparison against a MuJoCo-order motion-lib PKL.
+    """
+    return _get_joint_indices_by_names(
+        asset,
+        RBY1_ACTUAL_ISAACLAB_DOF_NAMES,
+        _body_joint_indices_cache,
+        expected_count=24,
+        label="RBY1 IsaacLab-order body joints",
     )

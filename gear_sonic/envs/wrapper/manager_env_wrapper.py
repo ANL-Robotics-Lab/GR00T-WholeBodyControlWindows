@@ -171,8 +171,32 @@ class ManagerEnvWrapper:
             self.viewer_focused = False
 
     def _setup_replay_joint_indices(self):
-        """Setup joint indices for replay mode if robot has more DOFs than motion lib (29)."""
-        if self.env.scene["robot"].num_joints > 29:
+        """Setup joint indices for replay mode if robot has more DOFs than the motion library.
+
+        The original logic only handled the G1 43-vs-29 case via ``num_joints > 29``.
+        RBY1 uses a 28-joint USD articulation with a 24-DOF motion library, so the
+        comparison must be against the configured/actual motion-library DOF count.
+        """
+        if self.motion_command is None:
+            return
+
+        robot_num_joints = self.env.scene["robot"].num_joints
+
+        motion_lib_num_dof = getattr(self.motion_command, "motion_lib_num_dof", None)
+        if motion_lib_num_dof is None:
+            motion_lib_num_dof = getattr(self.motion_command.cfg, "motion_lib_num_dof", None)
+        if motion_lib_num_dof is None:
+            motion_lib_cfg = getattr(self.motion_command.cfg, "motion_lib_cfg", None)
+            if motion_lib_cfg is not None:
+                motion_lib_num_dof = motion_lib_cfg.get("motion_lib_num_dof", None)
+
+        # Fallback for older configs: preserve the old G1 behavior.
+        if motion_lib_num_dof is None:
+            motion_lib_num_dof = 29
+
+        robot = self.env.scene["robot"]
+        needs_name_mapping = "right_wheel" in robot.joint_names
+        if robot_num_joints > int(motion_lib_num_dof) or needs_name_mapping:
             self._setup_action_joint_indices()
 
     def _compute_tokenizer_obs_indices(self):
@@ -222,6 +246,262 @@ class ManagerEnvWrapper:
         robot = self.env.scene["robot"]
         self._body_joint_indices = get_body_joint_indices(robot)
         self._hand_joint_indices = get_hand_joint_indices(robot)
+
+        # Replay diagnostics. These are intentionally always available once joint
+        # mappings are computed, but only print when ++replay_joint_log=True.
+        if self._replay_joint_log_enabled():
+            self._replay_print("\n================ REPLAY JOINT MAP ================")
+            self._replay_print(f"robot.num_joints: {robot.num_joints}")
+            self._replay_print(
+                f"robot.joint_names ({len(robot.joint_names)}): {robot.joint_names}"
+            )
+            self._replay_print(
+                f"body_joint_indices ({len(self._body_joint_indices)}): "
+                f"{self._body_joint_indices.detach().cpu().tolist()}"
+            )
+            if self._hand_joint_indices is None:
+                self._replay_print("hand_joint_indices: None")
+            else:
+                self._replay_print(
+                    f"hand_joint_indices ({len(self._hand_joint_indices)}): "
+                    f"{self._hand_joint_indices.detach().cpu().tolist()}"
+                )
+            for i, idx in enumerate(self._body_joint_indices.detach().cpu().tolist()):
+                name = robot.joint_names[idx] if idx < len(robot.joint_names) else "<BAD_INDEX>"
+                self._replay_print(f"motion_dof[{i:02d}] -> robot_joint[{idx:02d}] {name}")
+            self._replay_print("==================================================\n")
+
+    def _replay_config_get(self, key: str, default=None):
+        """Read replay debug keys from either wrapper config or manager_env nesting."""
+        value = OmegaConf.select(self.config, key, default=None)
+        if value is not None:
+            return value
+        value = OmegaConf.select(self.config, f"manager_env.{key}", default=None)
+        if value is not None:
+            return value
+        return default
+
+    def _clip_replay_joint_targets(self, joint_pos: torch.Tensor) -> torch.Tensor:
+        """Keep teleported replay targets inside the articulation's hard limits.
+
+        Replay targets are assembled after motion-library -> Isaac joint mapping,
+        so clipping earlier (for example while loading the motion file) can use
+        the wrong joint order.  IsaacLab exposes limits as ``[..., 2]`` with
+        lower/upper bounds in the robot's actual articulation order.
+        """
+        if not self._replay_config_get("replay_clip_joint_limits", False):
+            return joint_pos
+
+        robot = self.motion_command.robot
+        limits = getattr(robot.data, "joint_limits", None)
+        if limits is None:
+            logger.warning("Replay joint-limit clipping requested, but joint_limits are unavailable")
+            return joint_pos
+
+        limits = limits[self._replay_env_ids]
+        if limits.shape[:2] != joint_pos.shape[:2] or limits.shape[-1] != 2:
+            raise RuntimeError(
+                "Replay joint limit shape mismatch: "
+                f"limits={tuple(limits.shape)}, targets={tuple(joint_pos.shape)}"
+            )
+
+        lower, upper = limits[..., 0], limits[..., 1]
+        clipped = torch.minimum(torch.maximum(joint_pos, lower), upper)
+
+        # The RBY torso has three serial pitch joints.  Their individual USD
+        # limits can all be valid while their *sum* still folds the torso too
+        # far backward.  Cap the aggregate pitch only when explicitly enabled;
+        # scaling preserves the retargeter's intended distribution across the
+        # three joints.
+        torso_pitch_limit = self._replay_config_get("replay_torso_pitch_limit", None)
+        if torso_pitch_limit is not None:
+            torso_pitch_limit = float(torso_pitch_limit)
+            torso_indices = [
+                i
+                for i, name in enumerate(robot.joint_names)
+                if name in ("torso_1", "torso_2", "torso_3")
+            ]
+            if torso_indices and torso_pitch_limit > 0.0:
+                torso_pitch = clipped[:, torso_indices]
+                torso_pitch_sum = torso_pitch.sum(dim=-1, keepdim=True)
+                scale = torch.clamp(
+                    torso_pitch_limit / torso_pitch_sum.abs().clamp_min(1e-8), max=1.0
+                )
+                clipped[:, torso_indices] = torso_pitch * scale
+
+        clipped_count = (clipped != joint_pos).sum().item()
+        if clipped_count and not getattr(self, "_replay_limit_warning_emitted", False):
+            logger.warning(
+                "Replay clipped {} joint target values to the RBY articulation limits. "
+                "Set replay_clip_joint_limits=false to inspect unclipped targets.",
+                clipped_count,
+            )
+            self._replay_limit_warning_emitted = True
+        return clipped
+
+    def _project_replay_root_to_yaw(
+        self, root_quat: torch.Tensor, root_ang_vel: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Remove root roll/pitch from planar replay clips while preserving yaw."""
+        if not self._replay_config_get("replay_planar_root", False):
+            return root_quat, root_ang_vel
+
+        # IsaacLab replay quaternions are wxyz. Extract heading and rebuild an
+        # upright quaternion so a tilted source root cannot tip the robot over.
+        w, x, y, z = root_quat.unbind(dim=-1)
+        yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        half_yaw = 0.5 * yaw
+        planar_quat = torch.zeros_like(root_quat)
+        planar_quat[..., 0] = torch.cos(half_yaw)
+        planar_quat[..., 3] = torch.sin(half_yaw)
+
+        planar_ang_vel = root_ang_vel.clone()
+        planar_ang_vel[..., :2] = 0.0
+        return planar_quat, planar_ang_vel
+
+    def _replay_joint_log_enabled(self) -> bool:
+        return bool(self._replay_config_get("replay_joint_log", False)) or bool(
+            self._replay_config_get("debug_replay_joint_log", False)
+        )
+
+    def _replay_print(self, msg: str):
+        print(msg, flush=True)
+
+    def _replay_log_tensor_stats(self, label: str, tensor: torch.Tensor):
+        """Small stats helper for replay logging."""
+        t = tensor.detach()
+        finite = torch.isfinite(t)
+        if not finite.all():
+            bad = (~finite).nonzero(as_tuple=False)
+            self._replay_print(
+                f"[ReplayJointLog] {label}: NON-FINITE at "
+                f"{bad[:20].detach().cpu().tolist()}"
+            )
+        if t.numel() == 0:
+            self._replay_print(f"[ReplayJointLog] {label}: empty")
+            return
+        if not finite.any():
+            self._replay_print(
+                f"[ReplayJointLog] {label}: no finite values, shape={tuple(t.shape)}"
+            )
+            return
+        tf = t[finite]
+        self._replay_print(
+            f"[ReplayJointLog] {label}: shape={tuple(t.shape)} "
+            f"min={tf.min().item():+.5f} max={tf.max().item():+.5f} "
+            f"mean={tf.mean().item():+.5f}"
+        )
+
+    def _log_replay_joint_frame(
+        self,
+        *,
+        motion_lib_joint_pos: torch.Tensor,
+        motion_lib_joint_vel: torch.Tensor,
+        joint_pos: torch.Tensor,
+        joint_vel: torch.Tensor,
+        root_pos: torch.Tensor,
+        root_quat: torch.Tensor,
+        label: str = "pre_write",
+    ):
+        """Print detailed joint replay diagnostics for env 0."""
+        if not self._replay_joint_log_enabled():
+            return
+
+        every = int(self._replay_config_get("replay_joint_log_every", 1))
+        if every <= 0:
+            every = 1
+
+        frame_i = int(getattr(self, "_replay_debug_frame_counter", 0))
+        if frame_i % every != 0:
+            return
+
+        robot = self.motion_command.robot
+        env_i = 0
+        if motion_lib_joint_pos.shape[0] <= env_i:
+            return
+
+        joint_names = list(robot.joint_names)
+        body_idx = self._body_joint_indices
+        hand_idx = self._hand_joint_indices
+
+        time_step = int(self._replay_time_steps[env_i].detach().cpu().item())
+        motion_id = int(self._replay_motion_ids[env_i].detach().cpu().item())
+
+        self._replay_print("\n================ REPLAY JOINT LOG ================")
+        self._replay_print(
+            f"frame_counter={frame_i} label={label} env={env_i} "
+            f"motion_id={motion_id} motion_step={time_step}"
+        )
+        self._replay_print(
+            f"robot_num_joints={robot.num_joints} "
+            f"motion_lib_num_dof={motion_lib_joint_pos.shape[-1]}"
+        )
+        self._replay_print(
+            f"root_pos[{env_i}]={root_pos[env_i].detach().cpu().numpy().round(5).tolist()}"
+        )
+        self._replay_print(
+            f"root_quat_wxyz[{env_i}]="
+            f"{root_quat[env_i].detach().cpu().numpy().round(5).tolist()}"
+        )
+
+        self._replay_log_tensor_stats("motion_lib_joint_pos", motion_lib_joint_pos)
+        self._replay_log_tensor_stats("motion_lib_joint_vel", motion_lib_joint_vel)
+        self._replay_log_tensor_stats("expanded_joint_pos", joint_pos)
+        self._replay_log_tensor_stats("expanded_joint_vel", joint_vel)
+
+        if body_idx is None:
+            self._replay_print("body_joint_indices=None; no expanded mapping is being used")
+        else:
+            ref = motion_lib_joint_pos[env_i]
+            expanded_at_body = joint_pos[env_i, body_idx]
+            err = expanded_at_body - ref
+            max_abs_err = err.abs().max().item() if err.numel() else 0.0
+            self._replay_print(
+                f"body_mapping_max_abs(expanded_at_body - motion_ref)={max_abs_err:.8f}"
+            )
+
+            self._replay_print("--- motion-lib DOF -> Isaac joint target ---")
+            limit = int(self._replay_config_get("replay_joint_log_limit", 64))
+            n = min(ref.numel(), limit)
+            for i in range(n):
+                ridx = int(body_idx[i].detach().cpu().item())
+                rname = joint_names[ridx] if 0 <= ridx < len(joint_names) else "<BAD_INDEX>"
+                self._replay_print(
+                    f"ml[{i:02d}] -> robot[{ridx:02d}] {rname:24s} "
+                    f"ref={ref[i].item():+9.5f} target={joint_pos[env_i, ridx].item():+9.5f} "
+                    f"vel={joint_vel[env_i, ridx].item():+9.5f}"
+                )
+
+        if hand_idx is not None and len(hand_idx) > 0:
+            self._replay_print("--- extra/hand joints held or filled ---")
+            for j, ridx_t in enumerate(hand_idx.detach().cpu().tolist()):
+                rname = joint_names[ridx_t] if 0 <= ridx_t < len(joint_names) else "<BAD_INDEX>"
+                self._replay_print(
+                    f"extra[{j:02d}] -> robot[{ridx_t:02d}] {rname:24s} "
+                    f"target={joint_pos[env_i, ridx_t].item():+9.5f} "
+                    f"vel={joint_vel[env_i, ridx_t].item():+9.5f}"
+                )
+
+        # In teleport replay this should match after write_joint_state_to_sim + sim.forward().
+        try:
+            actual = robot.data.joint_pos[self._replay_env_ids][env_i]
+            if actual.shape[-1] == joint_pos.shape[-1]:
+                actual_err = actual - joint_pos[env_i]
+                self._replay_print(
+                    f"actual_vs_target_full_max_abs={actual_err.abs().max().item():.8f} "
+                    f"mean_abs={actual_err.abs().mean().item():.8f}"
+                )
+                if body_idx is not None:
+                    actual_body_err = actual[body_idx] - motion_lib_joint_pos[env_i]
+                    self._replay_print(
+                        f"actual_body_vs_motion_ref_max_abs="
+                        f"{actual_body_err.abs().max().item():.8f} "
+                        f"mean_abs={actual_body_err.abs().mean().item():.8f}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            self._replay_print(f"Could not log actual robot joint_pos yet: {exc}")
+
+        self._replay_print("================================================\n")
 
     def _setup_finger_primitives(self):
         """Setup finger primitive action mapping from config.
@@ -1906,45 +2186,134 @@ class ManagerEnvWrapper:
         motion_lib_joint_vel = self._motion_lib.get_dof_vel(
             self._replay_motion_ids, self._replay_time_steps
         )
+        robot = self.motion_command.robot
+        if (
+            "right_wheel" in robot.joint_names
+            and motion_lib_joint_pos.shape[-1] == 24
+            and hasattr(self._motion_lib, "get_raw_dof_pos")
+        ):
+            motion_lib_joint_pos = self._motion_lib.get_raw_dof_pos(
+                self._replay_motion_ids, self._replay_time_steps
+            )
+            motion_lib_joint_vel = self._motion_lib.get_raw_dof_vel(
+                self._replay_motion_ids, self._replay_time_steps
+            )
+            motion_lib_joint_pos = self.motion_command.convert_raw_motion_dof_to_robot(
+                motion_lib_joint_pos
+            )
+            motion_lib_joint_vel = self.motion_command.convert_raw_motion_dof_to_robot(
+                motion_lib_joint_vel
+            )
 
-        # Handle DOF mismatch between motion library (e.g., 29 DOF) and robot (e.g., 43 DOF)
-        robot_num_joints = self.motion_command.robot.num_joints
+        # Handle DOF mismatch between motion library and robot articulation.
+        # Examples:
+        #   G1:  29-DOF motion lib -> 43-joint robot with dexterous hands
+        #   RBY1: 24-DOF motion lib -> 28-joint USD robot with backwheels + gripper
+        robot_num_joints = robot.num_joints
         motion_lib_num_dof = motion_lib_joint_pos.shape[-1]
+        needs_name_mapping = "right_wheel" in robot.joint_names
 
-        if robot_num_joints > motion_lib_num_dof and self._body_joint_indices is not None:
-            # Robot has more DOFs than motion lib (e.g., 43 DOF robot with 29 DOF motion data)
-            # Use body joint indices for proper mapping
+        # Replay can be used without policy/ATM setup, so lazily build the mapping here too.
+        if (
+            (robot_num_joints > motion_lib_num_dof or needs_name_mapping)
+            and self._body_joint_indices is None
+        ):
+            self._setup_action_joint_indices()
+
+        if self._body_joint_indices is not None:
+            # Map by name even when robot and motion have the same DOF count;
+            # RBY1's Isaac and MuJoCo orders differ despite both containing 24.
             num_envs = motion_lib_joint_pos.shape[0]
 
-            # Create full joint tensors with zeros for all DOFs
-            joint_pos = torch.zeros(
-                num_envs, robot_num_joints, device=self.device, dtype=motion_lib_joint_pos.dtype
-            )
-            joint_vel = torch.zeros(
-                num_envs, robot_num_joints, device=self.device, dtype=motion_lib_joint_vel.dtype
-            )
+            # Start from the robot defaults rather than zeros. This matters for
+            # extra joints such as RBY1 backwheels/grippers whose neutral pose may
+            # not be exactly zero in the USD/asset config.
+            joint_pos = self.motion_command.robot.data.default_joint_pos[
+                self._replay_env_ids
+            ].clone()
+            joint_vel = torch.zeros_like(joint_pos)
 
-            # Map motion lib data to body joint indices (using G1_ISAACLab_ORDER mapping)
+            if joint_pos.shape[-1] != robot_num_joints:
+                raise RuntimeError(
+                    f"Replay default_joint_pos shape mismatch: expected {robot_num_joints}, "
+                    f"got {joint_pos.shape[-1]}"
+                )
+
+            if len(self._body_joint_indices) != motion_lib_num_dof:
+                raise RuntimeError(
+                    f"Replay body/motion DOF mismatch: body_joint_indices has "
+                    f"{len(self._body_joint_indices)} entries, but motion data has "
+                    f"{motion_lib_num_dof} DOFs. body_joint_indices="
+                    f"{self._body_joint_indices.tolist()}"
+                )
+
+            # Map motion-lib data to the robot's body/motion joints.
             joint_pos[:, self._body_joint_indices] = motion_lib_joint_pos
             joint_vel[:, self._body_joint_indices] = motion_lib_joint_vel
 
-            # Use hand DOFs from motion lib if available, otherwise default to zero
+            # If the motion file includes extra hand/gripper DOFs, map them to the
+            # extra joints by index. Otherwise leave extra positions at default
+            # and velocities at zero.
             hand_dof_pos = self._motion_lib.get_hand_dof_pos(
                 self._replay_motion_ids, self._replay_time_steps
             )
-            if hand_dof_pos is not None:
-                # Hand DOFs are the last N joints (in Isaac order, not G1_HAND_JOINTS order)
-                num_hand_dof = hand_dof_pos.shape[-1]
-                joint_pos[:, -num_hand_dof:] = hand_dof_pos
+            if (
+                hand_dof_pos is not None
+                and self._hand_joint_indices is not None
+                and hand_dof_pos.shape[-1] == len(self._hand_joint_indices)
+            ):
+                joint_pos[:, self._hand_joint_indices] = hand_dof_pos
+
+            hand_dof_vel = None
+            if hasattr(self._motion_lib, "get_hand_dof_vel"):
+                hand_dof_vel = self._motion_lib.get_hand_dof_vel(
+                    self._replay_motion_ids, self._replay_time_steps
+                )
+            if (
+                hand_dof_vel is not None
+                and self._hand_joint_indices is not None
+                and hand_dof_vel.shape[-1] == len(self._hand_joint_indices)
+            ):
+                joint_vel[:, self._hand_joint_indices] = hand_dof_vel
+
+            # Prefer TrackingCommand's configured default extras if available.
+            if (
+                hand_dof_pos is None
+                and self._hand_joint_indices is not None
+                and hasattr(self.motion_command, "extra_default_positions")
+            ):
+                extra_pos = self.motion_command.extra_default_positions
+                if extra_pos is not None and extra_pos.numel() == len(self._hand_joint_indices):
+                    joint_pos[:, self._hand_joint_indices] = extra_pos.unsqueeze(0).expand(
+                        num_envs, -1
+                    )
         else:
             joint_pos = motion_lib_joint_pos
             joint_vel = motion_lib_joint_vel
+
+        # Clip only after the complete motion->articulation mapping.  This keeps
+        # replay from commanding a joint outside the limits of the actual USD
+        # articulation, including RBY1's extra wheel/gripper joints.
+        joint_pos = self._clip_replay_joint_targets(joint_pos)
+        root_quat, root_ang_vel = self._project_replay_root_to_yaw(root_quat, root_ang_vel)
 
         # Add environment origin offsets (use custom grid origins if set)
         if hasattr(self, "_replay_custom_origins"):
             root_pos = root_pos + self._replay_custom_origins[self._replay_env_ids]
         else:
             root_pos = root_pos + self.env.scene.env_origins[self._replay_env_ids]
+
+        # Print the target mapping before writing it. This is the most important
+        # place to diagnose motion-lib order -> Isaac joint order problems.
+        self._log_replay_joint_frame(
+            motion_lib_joint_pos=motion_lib_joint_pos,
+            motion_lib_joint_vel=motion_lib_joint_vel,
+            joint_pos=joint_pos,
+            joint_vel=joint_vel,
+            root_pos=root_pos,
+            root_quat=root_quat,
+            label="pre_write",
+        )
 
         # Write state to simulation for all environments
         self.motion_command.robot.write_joint_state_to_sim(
@@ -2035,6 +2404,23 @@ class ManagerEnvWrapper:
             self._update_contact_center_visualization()
 
         self.env.sim.forward()
+
+        # Optional second log after sim.forward() so actual robot.data.joint_pos can
+        # be compared against the target. Keep this less frequent if logs are noisy.
+        if bool(self._replay_config_get("replay_joint_log_post_write", False)):
+            self._log_replay_joint_frame(
+                motion_lib_joint_pos=motion_lib_joint_pos,
+                motion_lib_joint_vel=motion_lib_joint_vel,
+                joint_pos=joint_pos,
+                joint_vel=joint_vel,
+                root_pos=root_pos,
+                root_quat=root_quat,
+                label="post_forward",
+            )
+
+        self._replay_debug_frame_counter = int(
+            getattr(self, "_replay_debug_frame_counter", 0)
+        ) + 1
 
     def step_replay(self):
         """Step the replay forward for all environments. Call this in a loop to animate the motions.

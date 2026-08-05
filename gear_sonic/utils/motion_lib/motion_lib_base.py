@@ -43,6 +43,25 @@ def to_torch(tensor):
         return torch.from_numpy(tensor)
 
 
+def interpolate_linear_frames(data, source_fps, target_fps, num_frames):
+    """Linearly sample frame data on the FK interpolation time grid."""
+    if data.shape[0] == 0:
+        raise ValueError("Cannot interpolate an empty motion array.")
+    if data.shape[0] == 1:
+        return data.expand(num_frames, *data.shape[1:]).clone()
+
+    source_positions = (
+        torch.arange(num_frames, device=data.device, dtype=torch.float64)
+        * float(source_fps)
+        / float(target_fps)
+    ).clamp_(0.0, float(data.shape[0] - 1))
+    frame0 = source_positions.floor().long()
+    frame1 = (frame0 + 1).clamp_max(data.shape[0] - 1)
+    blend_shape = (num_frames,) + (1,) * (data.ndim - 1)
+    blend = (source_positions - frame0).to(dtype=data.dtype).reshape(blend_shape)
+    return data[frame0] * (1.0 - blend) + data[frame1] * blend
+
+
 def is_navigation_motion(motion_key):
     return (
         motion_key.startswith("2025")
@@ -581,6 +600,24 @@ class MotionLibBase:
     def get_dof_vel(self, motion_ids, motion_steps):
         length_starts = self.length_starts[motion_ids]
         return self.dof_vel[motion_steps + length_starts]
+
+    def get_raw_dof_pos(self, motion_ids, motion_steps):
+        """Get raw PKL ``dof`` values before any IsaacLab/MuJoCo reordering."""
+        length_starts = self.length_starts[motion_ids]
+        if hasattr(self, "raw_dof_pos"):
+            return self.raw_dof_pos[motion_steps + length_starts]
+        dof_pos = self.dof_pos[motion_steps + length_starts]
+        mapping = self.m_cfg.get("isaaclab_to_mujoco_dof", None)
+        return dof_pos if mapping is None else dof_pos[..., mapping]
+
+    def get_raw_dof_vel(self, motion_ids, motion_steps):
+        """Get velocities computed from raw PKL ``dof`` values."""
+        length_starts = self.length_starts[motion_ids]
+        if hasattr(self, "raw_dof_vel"):
+            return self.raw_dof_vel[motion_steps + length_starts]
+        dof_vel = self.dof_vel[motion_steps + length_starts]
+        mapping = self.m_cfg.get("isaaclab_to_mujoco_dof", None)
+        return dof_vel if mapping is None else dof_vel[..., mapping]
 
     def get_hand_dof_pos(self, motion_ids, motion_steps):
         """Get hand DOF positions if available (for 43-DOF motion on 43-DOF robot)."""
@@ -1547,6 +1584,13 @@ class MotionLibBase:
 
         if "dof_pos" in motions[0].__dict__:
             self.dof_pos = torch.cat([m.dof_pos for m in motions], dim=0).float().to(self._device)
+        if "raw_dof_pos" in motions[0].__dict__:
+            self.raw_dof_pos = (
+                torch.cat([m.raw_dof_pos for m in motions], dim=0).float().to(self._device)
+            )
+            self.raw_dof_vel = (
+                torch.cat([m.raw_dof_vels for m in motions], dim=0).float().to(self._device)
+            )
 
         # Store hand DOF positions if available (for 43-DOF motion)
         if "hand_dof_pos" in motions[0].__dict__:
@@ -2160,6 +2204,35 @@ class MotionLibBase:
                 if self.has_action:
                     curr_motion.action = to_torch(curr_file["action"]).clone()[start:end]
 
+                if "dof" in curr_file:
+                    raw_dof = to_torch(curr_file["dof"]).clone()[start:end]
+                    dof_count = curr_motion["dof_pos"].shape[-1]
+                    raw_dof = raw_dof[:, :dof_count]
+                    num_target_frames = curr_motion["dof_pos"].shape[0]
+                    if (
+                        raw_dof.shape[0] != num_target_frames
+                        or curr_file["fps"] != self.target_fps
+                    ):
+                        raw_dof = interpolate_linear_frames(
+                            raw_dof,
+                            source_fps=curr_file["fps"],
+                            target_fps=self.target_fps,
+                            num_frames=num_target_frames,
+                        )
+                    if freeze_frame_aug:
+                        freeze_idx_new_fps = int(freeze_idx * self.target_fps / curr_file["fps"])
+                        raw_dof[freeze_idx_new_fps:] = raw_dof[
+                            freeze_idx_new_fps : freeze_idx_new_fps + 1
+                        ].clone()
+
+                    raw_dof_vel = torch.zeros_like(raw_dof)
+                    if raw_dof.shape[0] > 1:
+                        target_dt = 1.0 / self.target_fps
+                        raw_dof_vel[1:] = (raw_dof[1:] - raw_dof[:-1]) / target_dt
+                        raw_dof_vel[0] = raw_dof_vel[1]
+                    curr_motion.raw_dof_pos = raw_dof
+                    curr_motion.raw_dof_vels = raw_dof_vel
+
                 # Extract hand DOFs if motion file has more than 29 DOFs
                 hand_dof_count = self.m_cfg.get("hand_dof_count", 0)
                 if hand_dof_count > 0 and "dof" in curr_file:
@@ -2168,19 +2241,13 @@ class MotionLibBase:
                         # Extract hand DOFs (indices 29 onwards) and interpolate to target FPS
                         hand_dof = raw_dof[:, 29 : 29 + hand_dof_count]
                         if curr_file["fps"] != self.target_fps:
-                            # Simple linear interpolation for hand DOFs
                             num_target_frames = curr_motion["dof_pos"].shape[0]
-                            hand_dof_interp = (
-                                torch.nn.functional.interpolate(
-                                    hand_dof.T.unsqueeze(0),  # (1, C, T)
-                                    size=num_target_frames,
-                                    mode="linear",
-                                    align_corners=True,
-                                )
-                                .squeeze(0)
-                                .T
-                            )  # (T, C)
-                            curr_motion.hand_dof_pos = hand_dof_interp
+                            curr_motion.hand_dof_pos = interpolate_linear_frames(
+                                hand_dof,
+                                source_fps=curr_file["fps"],
+                                target_fps=self.target_fps,
+                                num_frames=num_target_frames,
+                            )
                         else:
                             curr_motion.hand_dof_pos = hand_dof
 

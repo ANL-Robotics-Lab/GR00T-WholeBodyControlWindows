@@ -267,6 +267,7 @@ def main(config: OmegaConf):
 
         # Base kit args (quiet logs)
         args_cli.kit_args = (
+            "--/app/vulkan=false "
             "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error"
         )
 
