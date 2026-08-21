@@ -1,0 +1,3 @@
+numpy==2.4.6
+joblib==1.5.3
+rby1-sdk==0.9.1
